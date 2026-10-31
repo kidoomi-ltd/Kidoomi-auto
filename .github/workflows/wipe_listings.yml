@@ -1,0 +1,57 @@
+name: Wipe Listings (export first, delete all)
+
+# The store starts clean (user 2026-10-31). Every run sweeps and EXPORTS the full listing table as an artifact before anything
+# else; deletion happens only with dry_run=no AND confirm=WIPE typed out. Suspended listings always refuse the API and land in
+# suspended_skus.txt for the owner. No schedule - dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "yes = sweep + export only (the default)"
+        required: false
+        default: "yes"
+      confirm:
+        description: "type WIPE to allow a live run to delete EVERY listing on the account"
+        required: false
+        default: ""
+      max_delete:
+        description: "refuse a live run above this many listings"
+        required: false
+        default: "25000"
+
+concurrency:
+  group: onbuy-api
+  cancel-in-progress: false
+
+jobs:
+  wipe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Sweep, export and (confirmed only) delete
+        env:
+          ONBUY_CONSUMER_KEY: ${{ secrets.ONBUY_CONSUMER_KEY }}
+          ONBUY_SECRET_KEY: ${{ secrets.ONBUY_SECRET_KEY }}
+          ONBUY_SELLER_ID: ${{ secrets.ONBUY_SELLER_ID }}
+          ONBUY_SITE_ID: ${{ secrets.ONBUY_SITE_ID }}
+          DRY_RUN: ${{ inputs.dry_run == 'no' && '0' || '1' }}
+          CONFIRM: ${{ inputs.confirm }}
+          MAX_DELETE: ${{ inputs.max_delete }}
+        run: python -u wipe_listings.py
+      - name: Keep the export and the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kidoomi_wipe_${{ github.run_id }}
+          path: |
+            kidoomi_listings_export.csv
+            delete_results.csv
+            suspended_skus.txt
+          if-no-files-found: ignore

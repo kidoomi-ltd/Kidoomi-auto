@@ -1,0 +1,414 @@
+"""OnBuy REST API client.
+
+Wraps the auth / create-product / update-listing calls that previously only
+existed as disconnected manual test scripts (test_onbuy_auth.py,
+test_create_product.py, test_update_listing.py) so the scheduled pipeline can
+actually push to OnBuy's API instead of relying solely on the XML feed
+importer. The XML feed generation stays in generate_xml.py as a fallback.
+"""
+import logging
+import os
+
+import requests
+
+import sku_aliases
+from retry_utils import AuthError, PermanentError, raise_for_status, with_retry
+
+logger = logging.getLogger("onbuy_sync")
+
+BASE_URL = "https://api.onbuy.com/v2"
+
+
+def _raise_on_result_error(body, sku, what):
+    """OnBuy's bulk-style endpoints (e.g. PUT /v2/listings/by-sku) return HTTP
+    200 with a top-level "success": true even when the actual per-item
+    operation failed - the real outcome is buried in body["results"][i]["error"].
+    A plain HTTP-status check (raise_for_status) cannot see this at all, which
+    is exactly how every push in earlier runs was silently failing with
+    "SKU does not exist" while being logged as a success. Check explicitly.
+    """
+    if not isinstance(body, dict):
+        return
+    results = body.get("results")
+    if not isinstance(results, list) or not results:
+        return
+    matching = [r for r in results if isinstance(r, dict) and r.get("sku") == sku]
+    target = matching[0] if matching else (results[0] if len(results) == 1 else None)
+    if isinstance(target, dict) and target.get("error"):
+        raise PermanentError(f"{what}: {target['error']}")
+
+
+class OnBuyClient:
+    def __init__(self, consumer_key=None, secret_key=None, seller_id=None, site_id=None, use_sandbox=None):
+        # OnBuy's sandbox is the same api.onbuy.com host - only the credentials
+        # differ, so this is a credential swap, not a base-URL swap.
+        if use_sandbox is None:
+            use_sandbox = os.getenv("ONBUY_USE_SANDBOX", "false").strip().lower() == "true"
+        self.use_sandbox = use_sandbox
+
+        if use_sandbox:
+            self.consumer_key = consumer_key or os.getenv("ONBUY_TEST_CONSUMER_KEY")
+            self.secret_key = secret_key or os.getenv("ONBUY_TEST_SECRET_KEY")
+            # Sandbox seller/site IDs haven't been provided separately yet -
+            # fall back to the production ones. If OnBuy issues distinct
+            # sandbox IDs later, set ONBUY_TEST_SELLER_ID/ONBUY_TEST_SITE_ID
+            # and this will pick them up automatically.
+            self.seller_id = int(seller_id or os.getenv("ONBUY_TEST_SELLER_ID") or os.getenv("ONBUY_SELLER_ID") or 0)
+            self.site_id = int(site_id or os.getenv("ONBUY_TEST_SITE_ID") or os.getenv("ONBUY_SITE_ID") or 0)
+        else:
+            self.consumer_key = consumer_key or os.getenv("ONBUY_CONSUMER_KEY")
+            self.secret_key = secret_key or os.getenv("ONBUY_SECRET_KEY")
+            self.seller_id = int(seller_id or os.getenv("ONBUY_SELLER_ID") or 0)
+            self.site_id = int(site_id or os.getenv("ONBUY_SITE_ID") or 0)
+
+        self._token = None
+        logger.info("OnBuyClient initialized (sandbox=%s)", self.use_sandbox)
+
+    def authenticate(self):
+        """Returns True on success. Never raises - callers must check the
+        return value before doing per-item work. The old pipeline used a
+        possibly-None eBay token as if it were valid, letting a bad token
+        cascade through an entire batch; this client refuses to do that."""
+        if not self.consumer_key or not self.secret_key:
+            key_names = "ONBUY_TEST_CONSUMER_KEY/ONBUY_TEST_SECRET_KEY" if self.use_sandbox else "ONBUY_CONSUMER_KEY/ONBUY_SECRET_KEY"
+            logger.error("OnBuy credentials missing (%s)", key_names)
+            return False
+
+        def _do_auth():
+            resp = requests.post(
+                f"{BASE_URL}/auth/request-token",
+                data={"consumer_key": self.consumer_key, "secret_key": self.secret_key},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+            raise_for_status(resp, what="onbuy auth")
+            token = resp.json().get("access_token")
+            if not token:
+                raise AuthError("onbuy auth response missing access_token")
+            return token
+
+        try:
+            self._token = with_retry(_do_auth, what="onbuy auth", max_attempts=3)
+        except (AuthError, PermanentError) as exc:
+            logger.error("OnBuy authentication failed: %s", exc)
+            self._token = None
+        except Exception as exc:
+            logger.error("OnBuy authentication failed after retries: %s", exc)
+            self._token = None
+        return bool(self._token)
+
+    def health_check(self):
+        return bool(self._token) or self.authenticate()
+
+    def _headers(self):
+        # OnBuy expects the raw token as the Authorization value, not "Bearer <token>"
+        # - matches the already-verified test_create_product.py/test_update_listing.py behavior.
+        return {"Authorization": self._token, "Content-Type": "application/json"}
+
+    def _send(self, method, url, *, what, **kwargs):
+        """requests.request with one automatic re-auth on a 401. The token is
+        fetched once at run start, but it can die mid-run: OnBuy tokens
+        expire, and any other workflow requesting a token with the same
+        credentials (e.g. the hourly backfill firing while a long sync run
+        is still going) can supersede it - confirmed 2026-07-06 when a run
+        overlapping another one started getting 401 "badToken" on every call
+        partway through. Refresh once and repeat the call instead of failing
+        every remaining push in the run.
+        """
+        kwargs.setdefault("timeout", 60)
+        resp = requests.request(method, url, headers=self._headers(), **kwargs)
+        if resp.status_code == 401 and self.authenticate():
+            logger.info("%s: OnBuy token rejected mid-run - re-authenticated, retrying once", what)
+            resp = requests.request(method, url, headers=self._headers(), **kwargs)
+        if method.upper() == "GET" and resp.status_code == 200 and str(url).rstrip("/").endswith("/listings"):
+            self._listings_total = self._total_rows(resp)
+        return resp
+
+    _listings_total = None      # total_rows of the last GET /listings answer (None = the answer carried none)
+
+    @staticmethod
+    def _total_rows(resp):
+        try:
+            body = resp.json()
+            total = ((body.get("metadata") or {}).get("total_rows") if isinstance(body, dict) else None)
+            return total if isinstance(total, int) else None
+        except (ValueError, AttributeError):
+            return None
+
+    def more_listings(self, offset, limit=100):
+        """True when OnBuy's own total_rows (metadata of the LAST GET /listings answer) says more listings follow the page that started at `offset`.
+        A page with fewer than `limit` items is NOT necessarily the last one: a listing hidden from the page leaves it short (Makstore 2026-10-10: the
+        page at offset 9,100 held 99 items while total_rows was 11,102, and every sweep that stopped there never saw the oldest ~1,900 listings).
+        False when the answer carried no total_rows - the callers then behave exactly as before."""
+        total = self._listings_total
+        return isinstance(total, int) and total > offset + limit
+
+    @staticmethod
+    def _fit_product_name(title, limit=150):
+        """OnBuy counts the ENCODED name - '&' as '&amp;' and multi-byte
+        characters as their UTF-8 bytes - so a plain [:150] slice still
+        bounced 54 titles with 'exceeds the 150 character limit'
+        (2026-09-22). Trim at word boundaries until the encoded form
+        fits; the Sheet keeps the full title."""
+        t = " ".join(str(title or "").split())
+
+        def _enc_len(s):
+            return len(s.replace("&", "&amp;").encode("utf-8"))
+
+        while t and _enc_len(t) > limit:
+            cut = t[:-1]
+            sp = cut.rfind(" ")
+            t = (cut[:sp] if sp > 40 else cut).rstrip(" ,;-.")
+        return t
+
+    def create_product(self, *, sku, ean, title, description, brand, category_id, price, main_image, additional_images, stock=0):
+        payload = {
+            "site_id": self.site_id,
+            "seller_id": self.seller_id,
+            "uid": sku,
+            "published": "1",
+            "category_id": category_id,
+            "product_codes": [ean] if ean else [],
+            "rrp": str(price),
+            "product_name": self._fit_product_name(title),
+            "brand_name": brand or "Unbranded",
+            # OnBuy nulls an empty-string description server-side and then
+            # rejects the whole create with 400 "description must be a
+            # string" (seen 2026-07-06 for eBay listings that genuinely have
+            # no description text). Fall back to the title so those products
+            # can still be listed; the Sheet/Supabase keep the real (empty)
+            # description.
+            "description": (description or "").strip() or title[:150],
+            "default_image": main_image,
+            "additional_images": additional_images[:10],
+            "force_update": True,
+            # Product creation alone leaves an approved catalogue entry with
+            # NO seller offer attached - OnBuy support confirmed (2026-07-27)
+            # that's exactly what stranded the July submissions: products
+            # existed, listings were never created. The nested listing block
+            # attaches our inventory in the same submission.
+            "listings": {"new": {"sku": sku, "price": str(price), "stock": int(stock or 0)}},
+        }
+
+        def _do_create():
+            logger.info("OnBuy create_product(%s) request payload: %s", sku, payload)
+            resp = self._send("POST", f"{BASE_URL}/products", what=f"onbuy create_product({sku})", json=payload)
+            logger.info("OnBuy create_product(%s) raw response [%s]: %s", sku, resp.status_code, resp.text[:2000])
+            raise_for_status(resp, what=f"onbuy create_product({sku})")
+            body = resp.json()
+            _raise_on_result_error(body, sku, what=f"onbuy create_product({sku})")
+            return body
+
+        return with_retry(_do_create, what=f"onbuy create_product({sku})", max_attempts=3)
+
+    def update_listing(self, *, sku, price, stock, delivery_template_id=None):
+        # Some listings are held under a corrupted SKU (sku_aliases.py); the
+        # wire SKU is the platform's, every log line stays in ours.
+        wire = sku_aliases.to_onbuy(sku)
+        record = {"sku": wire, "price": price, "stock": stock, "boost_marketing_commission": 0}
+        if delivery_template_id:
+            record["delivery_template_id"] = int(delivery_template_id)      # the supplier's template rides the same PUT (user 2026-10-30)
+        payload = {
+            "site_id": self.site_id,
+            "seller_id": self.seller_id,
+            "listings": [record],
+        }
+        label = sku if wire == sku else f"{sku} as {wire}"
+
+        def _do_update():
+            logger.info("OnBuy update_listing(%s) request payload: %s", label, payload)
+            resp = self._send("PUT", f"{BASE_URL}/listings/by-sku", what=f"onbuy update_listing({label})", json=payload)
+            logger.info("OnBuy update_listing(%s) raw response [%s]: %s", label, resp.status_code, resp.text[:2000])
+            raise_for_status(resp, what=f"onbuy update_listing({label})")
+            body = resp.json()
+            _raise_on_result_error(body, wire, what=f"onbuy update_listing({label})")
+            return body
+
+        return with_retry(_do_update, what=f"onbuy update_listing({label})", max_attempts=3)
+
+
+    def update_listings_by_sku_batch(self, listings):
+        """PUT /v2/listings/by-sku with up to 1,000 SKUs per request - OnBuy
+        support's own recommendation (2026-08-18) for reliable processing.
+        `listings` is [(sku, price, stock), ...]. Returns the raw per-item
+        result list; callers handle each item's optional "error" field (this
+        endpoint answers 200 with per-item errors inline, so an all-or-
+        nothing raise would hide partial success)."""
+        def _rec(item):
+            out = {"sku": sku_aliases.to_onbuy(item[0]), "price": item[1], "stock": item[2], "boost_marketing_commission": 0}
+            if len(item) > 3 and item[3]:
+                out["delivery_template_id"] = int(item[3])      # (sku, price, stock, template) - user 2026-10-30
+            return out
+
+        payload = {
+            "site_id": self.site_id,
+            "seller_id": self.seller_id,
+            "listings": [_rec(item) for item in listings],
+        }
+
+        def _do_batch():
+            logger.info("OnBuy update_listings_by_sku_batch: %d SKU(s)", len(payload["listings"]))
+            resp = self._send("PUT", f"{BASE_URL}/listings/by-sku",
+                              what=f"onbuy update_listings_by_sku_batch({len(payload['listings'])})",
+                              json=payload, timeout=120)
+            logger.info("OnBuy update_listings_by_sku_batch raw response [%s]: %s",
+                        resp.status_code, resp.text[:3000])
+            raise_for_status(resp, what="onbuy update_listings_by_sku_batch")
+            body = resp.json()
+            results = body.get("results") if isinstance(body, dict) else body
+            if not isinstance(results, list):
+                return []
+            # Callers key their outcomes off the SKU they passed in.
+            for item in results:
+                if isinstance(item, dict) and item.get("sku") is not None:
+                    item["sku"] = sku_aliases.to_true(item["sku"])
+            return results
+
+        return with_retry(_do_batch, what="onbuy update_listings_by_sku_batch", max_attempts=3)
+
+    def get_listing(self, sku):
+        """The one live listing record of a SKU (name, price, stock, OPC ...) through GET /v2/listings?filter[sku]= - ONE request
+        instead of a sweep of the account - or None when the SKU has no listing. Several listings answering to one SKU raise
+        PermanentError (never guess which). Transient trouble raises the usual retryable exceptions."""
+        wire = sku_aliases.to_onbuy(sku)      # the SKU the platform holds (sku_aliases.py)
+
+        def _do():
+            resp = self._send("GET", f"{BASE_URL}/listings", what=f"onbuy get_listing({sku})",
+                              params={"site_id": self.site_id, "limit": 5, "offset": 0, "filter[sku]": wire}, timeout=60)
+            raise_for_status(resp, what=f"onbuy get_listing({sku})")
+            return resp.json()
+
+        body = with_retry(_do, what=f"onbuy get_listing({sku})", max_attempts=3)
+        items = (body.get("results") if isinstance(body, dict) else body) or []
+        hit = [i for i in items if str((i or {}).get("sku") or "").strip() == wire]
+        if len(hit) > 1:
+            raise PermanentError(f"onbuy get_listing({sku}): {len(hit)} listings answer to this SKU")
+        return hit[0] if hit else None
+
+    def check_winning(self, skus):
+        """GET /v2/listings/check-winning (OnBuy support, 2026-08-21): Buy Box
+        status + competitive price per SKU. Returns the raw results list:
+        [{"sku", "price", "item_price", "delivery_price", "lead_price",
+          "lead_item_price", "lead_delivery_price", "winning": bool}, ...].
+        OnBuy documents it as a GET with a JSON body ({"site_id", "skus": [...]});
+        we send the body and mirror the SKUs as query params for safety."""
+        skus = [str(s).strip() for s in skus if str(s).strip()]
+        if not skus:
+            return []
+        # Ask about the SKUs the platform holds (sku_aliases.py), answer in ours.
+        skus = [sku_aliases.to_onbuy(s) for s in skus]
+        payload = {"site_id": self.site_id, "skus": skus}
+
+        def _do_check():
+            resp = self._send(
+                "GET", f"{BASE_URL}/listings/check-winning", what="onbuy check_winning",
+                params={"site_id": self.site_id, "skus[]": skus}, json=payload, timeout=120,
+            )
+            logger.info("OnBuy check_winning(%d skus) raw response [%s]: %s", len(skus), resp.status_code, resp.text[:1500])
+            raise_for_status(resp, what="onbuy check_winning")
+            body = resp.json()
+            results = body.get("results") if isinstance(body, dict) else body
+            for item in (results if isinstance(results, list) else []):
+                if isinstance(item, dict) and item.get("sku") is not None:
+                    item["sku"] = sku_aliases.to_true(item["sku"])
+            return results
+
+        return with_retry(_do_check, what="onbuy check_winning", max_attempts=3)
+
+    def create_listings_batch(self, listings):
+        """POST /v2/listings - attach seller offers to EXISTING catalogue
+        products by OPC ({"opc","sku","condition","price","stock"} each).
+        Returns the raw body; per-item errors are the caller's to inspect
+        (a batch may be partially successful, so no blanket raise here)."""
+        payload = {"site_id": self.site_id, "seller_id": self.seller_id, "listings": listings}
+
+        def _do_batch():
+            logger.info("OnBuy create_listings_batch request payload: %s", payload)
+            resp = self._send("POST", f"{BASE_URL}/listings", what="onbuy create_listings_batch", json=payload)
+            logger.info("OnBuy create_listings_batch raw response [%s]: %s", resp.status_code, resp.text[:4000])
+            raise_for_status(resp, what="onbuy create_listings_batch")
+            return resp.json()
+
+        return with_retry(_do_batch, what="onbuy create_listings_batch", max_attempts=3)
+
+    def list_listings(self):
+        """GET /v2/listings - the only direct way to see what's actually in
+        this account's catalog via the API. Needed because OnBuy's seller
+        dashboard only ever shows the production catalog, even when
+        authenticated with sandbox credentials - there is no visible UI for
+        sandbox data, so this is the sole ground truth for sandbox testing.
+        """
+        def _do_list():
+            resp = self._send(
+                "GET", f"{BASE_URL}/listings", what="onbuy list_listings",
+                params={"site_id": self.site_id}, timeout=30,
+            )
+            logger.info("OnBuy list_listings raw response [%s]: %s", resp.status_code, resp.text[:3000])
+            raise_for_status(resp, what="onbuy list_listings")
+            return resp.json()
+
+        return with_retry(_do_list, what="onbuy list_listings", max_attempts=3)
+
+    def check_queue(self, queue_id):
+        """GET /v2/queues?queue_id=... - per OnBuy support (2026-07-02): a
+        queue_id from POST /v2/products only means "accepted for async
+        processing," not "created." This checks whether that submission has
+        succeeded, is still pending, or failed - and, unlike the create
+        response itself, surfaces the actual validation/processing error.
+
+        Passed as a query param, not a URL path segment - putting it in the
+        path (/v2/queues/{queue_id}) got back "'' is not a valid queue_id",
+        meaning OnBuy's router wasn't reading it from the path at all.
+        """
+        def _do_check():
+            resp = self._send(
+                "GET", f"{BASE_URL}/queues", what=f"onbuy check_queue({queue_id})",
+                params={"site_id": self.site_id, "queue_id": queue_id}, timeout=30,
+            )
+            logger.info("OnBuy check_queue(%s) raw response [%s]: %s", queue_id, resp.status_code, resp.text[:3000])
+            raise_for_status(resp, what=f"onbuy check_queue({queue_id})")
+            return resp.json()
+
+        return with_retry(_do_check, what=f"onbuy check_queue({queue_id})", max_attempts=3)
+
+    def list_queue(self, limit=50, offset=0):
+        """GET /v2/queues, paginated - in practice the queue_id param above
+        didn't filter results (every queue_id tested returned the same recent
+        history), so this is the more reliable way to scan for a specific
+        SKU's outcome: page through recent submissions and match by "uid"
+        (which is the SKU). Used by backfill_onbuy_status.py.
+        """
+        def _do_list():
+            resp = self._send(
+                "GET", f"{BASE_URL}/queues", what=f"onbuy list_queue(offset={offset})",
+                params={"site_id": self.site_id, "limit": limit, "offset": offset}, timeout=30,
+            )
+            raise_for_status(resp, what=f"onbuy list_queue(offset={offset})")
+            return resp.json()
+
+        return with_retry(_do_list, what=f"onbuy list_queue(offset={offset})", max_attempts=3)
+
+    def sync_product(self, **kwargs):
+        """Update price/stock for an existing SKU; if OnBuy reports the SKU
+        doesn't exist ("SKU does not exist", returned as HTTP 200 with the
+        real error buried in results[].error - see _raise_on_result_error),
+        create it instead.
+        """
+        sku, price, stock = kwargs["sku"], kwargs["price"], kwargs["stock"]
+        try:
+            return "updated", self.update_listing(sku=sku, price=price, stock=stock)
+        except PermanentError as exc:
+            logger.info("update_listing(%s) rejected (%s) - attempting create_product instead", sku, exc)
+            result = self.create_product(
+                sku=sku,
+                ean=kwargs.get("ean"),
+                title=kwargs["title"],
+                description=kwargs["description"],
+                brand=kwargs.get("brand"),
+                category_id=kwargs["category_id"],
+                price=price,
+                main_image=kwargs.get("main_image", ""),
+                additional_images=kwargs.get("additional_images", []),
+                stock=stock,
+            )
+            return "created", result
