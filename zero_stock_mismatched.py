@@ -1,0 +1,213 @@
+"""One-off (2026-08-14): two wrong-item orders in 24h while the 210
+content repairs sit in OnBuy's pending queue. Emergency lever: set stock
+to 0 on EVERY currently-mismatched listing (shift + collision) via the
+by-SKU listings endpoint, which acts instantly and bypasses the product
+queue. Nothing is deleted; price and content stay untouched. Stock comes
+back automatically: shift rows are restored by normal rotation once their
+queued content fix lands; collision rows stay for the user's manual
+delist+relist worklist (re-run this pass if rotation re-pushes stock
+before that's done). DRY_RUN default on. Prints one parseable line per
+target for the user's review sheet."""
+import json
+import logging
+import os
+import re
+import time
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+import sheet_tabs
+
+from onbuy_client import BASE_URL, OnBuyClient
+import held_skus
+import listings_cache
+from retry_utils import RateLimitError, with_retry
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+DRY_RUN = (os.getenv("DRY_RUN") or "1").strip().lower() not in ("0", "no", "false", "")
+ZERO_SKUS = {s.strip() for s in (os.getenv("ZERO_SKUS") or "").split(",") if s.strip()}
+# Only the named SKUs (2026-10-05): a listing the name check cannot flag (same brand and half the same words as the product it
+# wrongly shows) is zeroed without touching any other mismatched listing.
+ZERO_ONLY_LISTED = (os.getenv("ZERO_ONLY_LISTED") or "").strip().lower() in ("1", "yes", "true")
+# The nightly sets PERSIST_HOLDS=1: every listing this pass holds is written to protected_skus.txt + hold_at_zero_skus.txt (a workflow step commits them),
+# so the hourly sync never restocks it (user 2026-10-12: "never restock the nightly zeroes"). Off elsewhere: tests and one-off runs must not write files.
+PERSIST_HOLDS = (os.getenv("PERSIST_HOLDS") or "0").strip().lower() in ("1", "yes", "true")
+
+
+# Listings checked BY HAND (2026-10-10): the live page IS this row's product, only worded differently (shared catalogue titles) - never a mismatch.
+SAME_PRODUCT = held_skus.load_skus(os.path.join(held_skus.HERE, "same_product_skus.txt"))
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
+
+
+def similar(a, b):
+    ta, tb = set(norm(a).split()), set(norm(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / min(len(ta), len(tb))
+
+
+def main():
+    onbuy = OnBuyClient()
+    if not onbuy.authenticate():
+        raise SystemExit("OnBuy auth failed")
+    listings = {}
+    # One shared sweep per nightly job (see listings_cache.py).
+    raw_items = listings_cache.load()
+    fetched = raw_items is None
+    if fetched:
+        raw_items = []
+    offset, limit = 0, 100
+    while fetched:
+        def _page(off=offset):
+            # OnBuy GET quota / transient server trouble must not kill a
+            # sweep mid-way (nightly 2026-09-20: Arden 429 after three
+            # full sweeps in one hour, GTV a stray 500) - wait it out.
+            for _try in range(6):
+                r = onbuy._send("GET", f"{BASE_URL}/listings", what="listings page",
+                                params={"site_id": onbuy.site_id, "limit": limit, "offset": off},
+                                timeout=60)
+                if r.status_code in (429, 500, 502, 503) and _try < 5:
+                    print(f"listings page: HTTP {r.status_code} - waiting 120s before retrying")
+                    time.sleep(120)
+                    continue
+                r.raise_for_status()
+                return r
+        body = with_retry(_page, what=f"listings page {offset}", max_attempts=3).json()
+        items = body.get("results") if isinstance(body, dict) else body
+        if isinstance(items, list) and 0 <= len(items) < limit:
+            # A short (or empty) page can be a transient OnBuy glitch, not
+            # the end of the list: one truncated sweep undercounted
+            # Makstore's live listings 3,499 vs 8,853 (2026-09-23) and
+            # briefly looked like a mass deletion. Re-fetch once and take
+            # the longer answer; a real final page repeats itself.
+            _b2 = with_retry(_page, what=f"listings page {offset} (end confirm)", max_attempts=3).json()
+            _i2 = _b2.get("results") if isinstance(_b2, dict) else _b2
+            if isinstance(_i2, list) and len(_i2) > len(items):
+                items = _i2
+        if not isinstance(items, list) or not items:
+            break
+        raw_items.extend(items)
+        if len(items) < limit and not onbuy.more_listings(offset, limit):
+            break
+        offset += limit
+    if fetched:
+        listings_cache.save(raw_items)
+    for it in raw_items:
+        it = it or {}
+        sku = str(it.get("sku") or "").strip()
+        if sku:
+            listings[sku] = (str(it.get("name") or "").strip(),
+                             str(it.get("stock") or "").strip(),
+                             str(it.get("price") or "").strip())
+    log.info("live listings: %d", len(listings))
+
+    creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(
+        creds_dict, ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
+    _book = gspread.authorize(creds).open("Kidoomi_Full_Feed_Master")
+    _tab = (os.getenv("SHEET_TAB") or "").strip()
+    sheet = sheet_tabs.product_sheet(_book) if not _tab else _book.worksheet(_tab)
+    print(f"worksheet: {sheet.title}")
+    rows = sheet.get_all_records()
+    # Displayed SKU text overrides numericise - leading zeros survive (see
+    # generate_xml.py's matching overlay, 2026-08-27).
+    _hdrs = [str(h).strip() for h in sheet.row_values(1)]
+    if "SKU" in _hdrs:
+        _sku_display = sheet.col_values(_hdrs.index("SKU") + 1)
+        for _i, _row in enumerate(rows):
+            if _i + 1 < len(_sku_display):
+                _row["SKU"] = str(_sku_display[_i + 1]).replace(",", "").strip()
+
+    targets, held, held_notes = [], [], {}
+    for i, r in enumerate(rows):
+        sku = str(r.get("SKU") or "").strip()
+        if not sku or sku not in listings:
+            continue
+        title = str(r.get("Title") or "").strip()
+        lname, lstock, lprice = listings[sku]
+        if ZERO_ONLY_LISTED and sku not in ZERO_SKUS:
+            continue
+        if sku not in ZERO_SKUS and (not title or similar(lname, title) >= 0.5 or held_skus.is_held(sku, SAME_PRODUCT)):
+            continue
+        held.append(sku)  # the audit holds it at 0 whether or not it still has stock to take off
+        held_notes[sku] = f"{sheet.title} row {i + 2}: row = {title[:45]} | page = {lname[:45]}"
+        # Already at zero (a previous pass got it, or it was empty anyway):
+        # nothing to protect - skipping makes every pass pure progress, so
+        # the chain converges instead of redoing the same head each run.
+        try:
+            if int(float(lstock or 0)) == 0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        # Which neighbour does OnBuy's name belong to? +1 = row below (GTV
+        # 2026-08-21), -1 = row above (YRA 2026-08-14); none = collision.
+        kind = "collision"
+        for k in (1, -1, 2, -2, 3, -3):
+            j = i + k
+            if 0 <= j < len(rows):
+                nt = str(rows[j].get("Title") or "").strip()
+                if nt and similar(lname, nt) >= 0.5:
+                    kind = f"shift{k:+d}"
+                    break
+        try:
+            price = float(r.get("Selling Price (£)") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            # Never push a 0.01 placeholder (price-below-minimum suspensions
+            # we caused ourselves, 2026-08-18): zero with the listing's own
+            # current price, and skip if it has none (0/0 is already inert).
+            try:
+                price = float(lprice or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0:
+                log.info("SKIP %s (row %d): no usable price on row or listing", sku, i + 2)
+                continue
+        targets.append((i + 2, sku, kind, lname, title, price, lstock))
+    log.info("mismatched listings to zero: %d (%d held in all, stock or not)", len(targets), len(held))
+    for t in targets:
+        log.info("TARGET|%d|%s|%s|%.2f|%s|%s|%s",
+                 t[0], t[1], t[2], t[5], t[6], t[3][:70], t[4][:70])
+    if DRY_RUN:
+        log.info("DRY RUN - no stock changed")
+        return
+    # Hand-off to the price/stock audit that runs next in the nightly job: it must not push the sheet's stock back onto these.
+    log.info("held at zero for the audit: %d", held_skus.remember(held))
+    if PERSIST_HOLDS:
+        added = held_skus.persist_holds([(s, held_notes.get(s, "")) for s in held])
+        log.info("kept at zero for good (protected_skus.txt + hold_at_zero_skus.txt): %d new SKU(s) %s", len(added), added[:12])
+
+    zeroed = failed = 0
+    # Account quota is 12,000 calls/day (user-confirmed) - the stops we hit
+    # were short-window burst limits. Pace at 1 call/second and, on a burst
+    # limit, wait it out and retry the same SKU instead of abandoning the run.
+    idx = 0
+    while idx < len(targets):
+        rownum, sku, kind, _, _, price, _ = targets[idx]
+        try:
+            onbuy.update_listing(sku=sku, price=price, stock=0)
+            zeroed += 1
+            log.info("ZEROED %s (%s, row %d)", sku, kind, rownum)
+            idx += 1
+        except RateLimitError:
+            log.warning("burst limit at %d/%d - waiting 90s and continuing", idx, len(targets))
+            time.sleep(90)
+            continue
+        except Exception as exc:
+            failed += 1
+            log.warning("ZERO %s failed - %s", sku, str(exc)[:150])
+            idx += 1
+        time.sleep(1.0)
+    log.info("DONE: %d zeroed, %d failed, %d untouched", zeroed, failed,
+             len(targets) - zeroed - failed)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3427 @@
+import base64
+import csv
+import logging
+import os
+import re
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import gspread
+import json
+import requests
+from oauth2client.service_account import ServiceAccountCredentials
+
+import oversell_guard
+import rotation
+import sheet_tabs
+
+import notify
+import fees
+import pricing
+import storage
+import supabase_db
+from onbuy_client import OnBuyClient
+import keepa_client
+import keepa_cache
+import sku_aliases
+import link_owners
+from retry_utils import AuthError, PermanentError, RateLimitError, TransientError, raise_for_status, with_retry
+from sanitize import sanitize_description, validate_images, strip_emojis
+
+# ================= LOGGING =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("onbuy_sync")
+
+# ================= CONFIG =================
+EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
+EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET")
+
+# ================= SETTINGS =================
+
+# TRUE = FETCH ALL PRODUCTS
+# FALSE = SMART BATCHING
+FULL_REFRESH = False
+
+# CATEGORY REMAP
+RUN_CATEGORY_MAPPING = True
+
+# ================= SCALING: DYNAMIC BATCH SIZE =================
+# Batch size is computed per run from the actual row count and this daily
+# eBay API budget, instead of a fixed number - see main() below. Stay
+# comfortably under eBay's rate limit (commonly ~5,000/day on the default
+# Browse API tier - check your exact allowance in the eBay Developer Portal
+# and adjust this if yours differs).
+# 4,800 of eBay's 5,000/day Browse allowance (user 2026-09-22: 200
+# headroom for probes/retries) - repo variable overrides this default.
+EBAY_DAILY_CALL_BUDGET = int(os.getenv("EBAY_DAILY_CALL_BUDGET") or "4800")
+
+# How many times this workflow runs per day - keep in sync with the cron
+# schedule in .github/workflows/run.yml (currently every 3 hours = 8/day).
+RUNS_PER_DAY = int(os.getenv("RUNS_PER_DAY") or "8")
+
+# Optional hard override: set this env var to force a fixed batch size
+# instead of the budget-derived one.
+_MAX_PRODUCTS_PER_RUN_OVERRIDE = os.getenv("MAX_PRODUCTS_PER_RUN")
+
+# Re-check order = age x risk weight (rotation.py, 2026-10-01). It replaced
+# the 2026-09-22 "low-stock lane", which spent ~half the daily eBay budget
+# re-checking the few hundred 1-4 unit rows every run while thousands of
+# default-stock rows went 2-5 days unchecked.
+
+# Which worksheet to run: unset = the first tab (eBay rows, the original
+# pipeline); "Amazon" = the Amazon tab - same header row and downstream
+# steps, fetched through Keepa (keepa_client.py, ported from GTV
+# 2026-09-14). Each tab has its own workflow; FEED_FILE keeps their feed
+# uploads apart.
+SHEET_TAB = (os.getenv("SHEET_TAB") or "").strip()
+FEED_FILE = (os.getenv("FEED_FILE") or "feed.xml").strip()
+
+
+# The supplier's delivery template rides the price/stock pushes (user 2026-10-30: "do that eBay and Amazon template specific
+# application on product creation time, not later"): a new listing is born on the account's default template, so the activation
+# pass and the per-row updates set the right one in the same request. Empty variables = the field stays out of every request.
+DELIVERY_TEMPLATE_EBAY = (os.getenv("DELIVERY_TEMPLATE_EBAY") or "").strip()
+DELIVERY_TEMPLATE_AMAZON = (os.getenv("DELIVERY_TEMPLATE_AMAZON") or "").strip()
+
+
+def row_delivery_template(row):
+    """The template this row's listing belongs on, or None. The Amazon tab's rows go on the Amazon template; a first-tab row by its
+    Supplier URL (delivery_templates.classify) - AliExpress and unknown suppliers stay wherever they are (the default template)."""
+    if not (DELIVERY_TEMPLATE_EBAY or DELIVERY_TEMPLATE_AMAZON):
+        return None
+    if SHEET_TAB.lower() == "amazon":
+        return DELIVERY_TEMPLATE_AMAZON or None
+    try:
+        from delivery_templates import classify
+        cls = classify(str(row.get("Supplier URL") or ""))
+    except Exception:
+        return None
+    return {"ebay": DELIVERY_TEMPLATE_EBAY or None, "amazon": DELIVERY_TEMPLATE_AMAZON or None}.get(cls)
+
+# ================= PRICE CHECK FLAG THRESHOLDS =================
+# Measured against the margin the formula gives THAT row (its cost band and
+# its category's real commission, 2026-09-09) rather than a fixed 40%:
+# Normal = within 5 points of the formula's own margin, Medium = up to 30
+# points above it, High = beyond. Adjust the two offsets if "a little
+# more" / "much more" should mean something else.
+PRICE_CHECK_NORMAL_OVER_PCT = 5
+PRICE_CHECK_MEDIUM_OVER_PCT = 30
+
+# ================= ONBUY API PUSH (safety-gated) =================
+# Off by default: this pipeline previously only ever produced feed.xml for
+# OnBuy's own feed importer to consume. Turning this on makes it call OnBuy's
+# write APIs directly for real SKUs. Since this hasn't been exercised against
+# the live account yet, roll it out gradually:
+#   1) leave ONBUY_API_PUSH_ENABLED unset/false -> behaves exactly as before
+#   2) set ONBUY_API_PUSH_ENABLED=true and ONBUY_API_TEST_SKUS=sku1,sku2
+#      -> only those SKUs go through the API, everything else still only
+#         goes through the Sheet + feed.xml as before
+#   3) once verified, clear ONBUY_API_TEST_SKUS to push every processed SKU
+ONBUY_API_PUSH_ENABLED = os.getenv("ONBUY_API_PUSH_ENABLED", "false").strip().lower() == "true"
+
+# Keepa prefetch / cache (keepa_cache.py, 2026-10-05). PREFETCH_ONLY = the lock-free job: the same batch selection, the Keepa
+# fetch, the answers saved to the private cache, then STOP - no OnBuy contact, no sheet writes. CACHE = the locked sync reads those
+# answers back and fetches live only what is missing (everything, as always, when no usable cache exists).
+KEEPA_PREFETCH_ONLY = (os.getenv("KEEPA_PREFETCH_ONLY") or "").strip().lower() in ("1", "yes", "true")
+KEEPA_CACHE = (os.getenv("KEEPA_CACHE") or "").strip().lower() in ("1", "yes", "true")
+KEEPA_CACHE_MAX_AGE_H = float(os.getenv("KEEPA_CACHE_MAX_AGE_HOURS") or "3")       # the sync: an own-run cache older than this is ignored
+KEEPA_PREFETCH_REUSE_H = float(os.getenv("KEEPA_PREFETCH_REUSE_HOURS") or "1.5")   # a prefetch re-run reuses a cache younger than this
+if KEEPA_PREFETCH_ONLY:
+    ONBUY_API_PUSH_ENABLED = False   # no OnBuy token request, OOS pass, oversell guard or push in the prefetch job
+    RUN_CATEGORY_MAPPING = False     # and no sheet write before the fetch
+ONBUY_API_TEST_SKUS = {s.strip() for s in os.getenv("ONBUY_API_TEST_SKUS", "").split(",") if s.strip()}
+
+# Confirmed from the real account's API usage page: OnBuy allows 240 PUT and
+# 240 POST calls per hour. The eBay-derived batch size above can now be much
+# larger than 12 (up to hundreds of rows/run), which didn't exist as a risk
+# when this was hardcoded at 12 - cap OnBuy pushes per run well under the
+# hourly limit so one large run can't burn through it on its own. Rows beyond
+# this cap still get their Sheet/Supabase update this run; they just wait
+# for their next turn to reach OnBuy.
+ONBUY_MAX_PUSHES_PER_RUN = int(os.getenv("ONBUY_MAX_PUSHES_PER_RUN") or "200")
+
+# Incident guards (2026-08-21, GTV content shift). ONBUY_CREATE_ENABLED=false
+# pauses product CREATES only - price/stock updates keep flowing - while
+# OnBuy's matcher is cross-linking consecutive API creates (listing N ends
+# up on neighbour N+1's product page). protected_skus.txt (repo root, one
+# SKU per line, # comments) lists listings whose OnBuy content is wrong and
+# awaiting repair: their price/stock pushes are skipped in the main loop and
+# the activation pass, so a zero-stocked wrong page cannot be re-armed before
+# the content fix lands. The OOS pass still zeroes them (always safe).
+ONBUY_CREATE_ENABLED = (os.getenv("ONBUY_CREATE_ENABLED") or "true").strip().lower() != "false"
+
+
+def _load_protected_skus():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "protected_skus.txt")
+    skus = set()
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    skus.add(line)
+    return skus
+
+
+PROTECTED_SKUS = _load_protected_skus()
+
+
+def load_category_denylist(path=None):
+    """Category ids OnBuy refuses as "not a lowest level category" although its API flags them listable
+    (category_denylist.txt: one id per line, # comments; found 2026-10-03: 38213 and 38188). Never raises."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_denylist.txt")
+    ids = set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                token = line.split("#", 1)[0].strip()
+                if token:
+                    ids.add(token)
+    except FileNotFoundError:
+        pass
+    return ids
+
+# How many eBay fetch failures (after retries) in one run before we email an alert.
+FETCH_FAILURE_ALERT_THRESHOLD = 3
+
+PK_TZ = ZoneInfo("Asia/Karachi")
+
+
+class _SkipPushProtected(Exception):
+    """Row's SKU is in protected_skus.txt (OnBuy shows wrong content, repair
+    pending): no price/stock push, no status change (2026-08-21)."""
+
+
+class _SkipCreatePaused(Exception):
+    """Creates are paused (ONBUY_CREATE_ENABLED=false) while OnBuy's matcher
+    cross-links consecutive creates - the row waits untouched (2026-08-21)."""
+
+
+class _SkipPushNoPrice(Exception):
+    """Control-flow sentinel: an already-created row with no usable selling
+    price must never push - OnBuy accepts a price-0 update and then
+    auto-suspends the listing (their support logs showed us doing exactly
+    this on dead-source rows, 2026-08-18). The OOS pass zeroes such rows
+    via the listing price fallback instead."""
+
+
+class _SkipPushDead(Exception):
+    """Control-flow sentinel: a row whose eBay listing is gone and that was
+    never created on OnBuy has nothing to create - see the raise site."""
+
+
+
+# One-off maintenance switch (workflow input "recategorize"): normally an
+# existing VALID category is never overwritten - that protects the manual
+# choices employees make. With this on, a confident eBay-Type match may
+# replace a valid-but-wrong category (the smart watch filed under Car GPS
+# Trackers, 2026-08-03). Only Type may overwrite; the title scorer never
+# does, and rows whose Type is unclear keep exactly what they have.
+RECATEGORIZE_FROM_TYPE = (os.getenv("RECATEGORIZE_FROM_TYPE") or "").strip().lower() in ("1", "yes", "true")
+
+# Delivery cost (user 2026-10-02): what an eBay seller charges to deliver the item joins the row's cost base and
+# is written into its Shipping Cost (£) cell ("free" when delivery is free). EBAY_SHIPPING_COST: "1" = on,
+# "shadow" (the default) = read eBay's quote and LOG what it would change - cells and prices stay as they are,
+# "0" = off (nothing read, nothing logged).
+EBAY_SHIPPING_MODE = (os.getenv("EBAY_SHIPPING_COST") or "shadow").strip().lower()
+EBAY_SHIPPING_COST = EBAY_SHIPPING_MODE in ("1", "on", "yes", "true")
+EBAY_SHIPPING_SHADOW = EBAY_SHIPPING_MODE == "shadow"
+
+def should_push_to_onbuy(sku):
+    if not ONBUY_API_PUSH_ENABLED:
+        return False
+    if ONBUY_API_TEST_SKUS:
+        return sku in ONBUY_API_TEST_SKUS
+    return True
+
+
+def _supplier_identity(url):
+    """The supplier-side PRODUCT id a link points at: 'amazon:<ASIN>' or
+    'ebay:<item id>' - the SKU registry's cheap same-listing test."""
+    u = str(url or "")
+    if supplier_of(u) == "Amazon":
+        asin = keepa_client.parse_asin(u)
+        return f"amazon:{asin}" if asin else ""
+    m = re.search(r"/itm/(\d+)", u)
+    if not m:
+        return ""
+    # A multi-variation eBay listing is ONE /itm/ id with a ?var= per
+    # variant - two rows on different variants are different products.
+    v = re.search(r"[?&]var(?:iationId)?=(\d+)", u)
+    return f"ebay:{m.group(1)}" + (f":{v.group(1)}" if v else "")
+
+
+def _title_similar(a, b):
+    """Token-overlap similarity - the same rule scan_content_mismatch
+    trusts in production for name-vs-title matching."""
+    na = set(re.sub(r"[^a-z0-9]+", " ", str(a or "").lower()).split())
+    nb = set(re.sub(r"[^a-z0-9]+", " ", str(b or "").lower()).split())
+    if not na or not nb:
+        return 0.0
+    return len(na & nb) / min(len(na), len(nb))
+
+
+def supplier_of(url):
+    """Which fetcher a Supplier URL belongs to - "eBay", "Amazon" (an
+    amazon.* link carrying an ASIN) or "" for anything else."""
+    u = str(url or "").strip().lower()
+    if "ebay." in u:
+        return "eBay"
+    if "amazon." in u and keepa_client.parse_asin(u):
+        return "Amazon"
+    return ""
+
+
+# ================= HELPERS =================
+def col_letter(n):
+    result = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
+def parse_time(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime(2000, 1, 1)
+
+
+
+
+# Hand-curated title PHRASES that name the product outright and must beat
+# the word scorer (2026-08-10). Two Toshiba "... Smart TV Bluetooth WiFi"
+# rows landed in Network Bluetooth Adapters: "bluetooth" is a triple-
+# weighted title word, while no TV leaf is reachable by scoring at all -
+# "TVs" tokenizes to a 2-letter word the tokenizer drops. A contiguous
+# phrase in the title is checked BEFORE the scorer; being hand-curated,
+# first match wins and there is no ambiguity to arbitrate. Keep entries
+# stemmed (category_match_tokens conventions) and add sparingly - one
+# phrase covers a whole device family, unlike per-SKU curation.
+TITLE_PHRASE_CATEGORIES = (
+    # 2026-10-22: 3D printers are not document printers. The scorer filed them under Computing & Gaming > Printers (Consumer
+    # Electronics, 7%) while OnBuy keeps 3D printing under Arts, Crafts & Sewing (Standard 15%) and charged 15% anyway (Makstore
+    # orders T6QR55D / T6Q6FJQ). Consumables before the machines: first match wins.
+    (("3d", "printer", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("3d", "printing", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("printer", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("pla", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("petg", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("abs", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("tpu", "filament"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printer Filament"),
+    (("3d", "printing", "pen"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printing Pens"),
+    (("3d", "pen"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printing Pens"),
+    (("3d", "printer"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printers"),
+    (("3d", "printing"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printers"),
+    (("resin", "printer"), "Arts, Crafts & Sewing > Other Crafts > 3D Printing > 3D Printers"),
+    (("smart", "tv"), "Electronics & Technology > TV & Audio > TVs & Accessories > TVs"),
+    (("led", "tv"), "Electronics & Technology > TV & Audio > TVs & Accessories > TVs"),
+    (("oled", "tv"), "Electronics & Technology > TV & Audio > TVs & Accessories > TVs"),
+    (("qled", "tv"), "Electronics & Technology > TV & Audio > TVs & Accessories > TVs"),
+    # 2026-08-20: hundreds of manual categorisations on a sibling store were
+    # phones/laptops/taps the scorer refused - one phrase each covers them.
+    (("smartphone",), "Electronics & Technology > Mobile & Smart Tech > Mobile Phones & Accessories > Mobile Phones"),
+    (("smart", "phone"), "Electronics & Technology > Mobile & Smart Tech > Mobile Phones & Accessories > Mobile Phones"),
+    (("mobile", "phone"), "Electronics & Technology > Mobile & Smart Tech > Mobile Phones & Accessories > Mobile Phones"),
+    (("laptop",), "Electronics & Technology > Computing & Gaming > Laptops, MacBooks & Accessories > Laptops"),
+    (("tablet",), "Electronics & Technology > Computing & Gaming > iPads, Tablets & eBook Readers > Tablets"),
+    (("kitchen", "tap"), "Tools & DIY > Kitchen & Bathroom Fixtures > Kitchen Fixtures > Kitchen Taps"),
+    (("kitchen", "mixer", "tap"), "Tools & DIY > Kitchen & Bathroom Fixtures > Kitchen Fixtures > Kitchen Taps"),
+    (("mixer", "tap"), "Tools & DIY > Kitchen & Bathroom Fixtures > Kitchen Fixtures > Kitchen Taps"),
+    (("basin", "tap"), "Tools & DIY > Kitchen & Bathroom Fixtures > Bathroom Fixtures > Bathroom Sink Taps"),
+    (("bath", "tap"), "Tools & DIY > Kitchen & Bathroom Fixtures > Bathroom Fixtures > Bath & Shower Taps"),
+    (("shower", "tap"), "Tools & DIY > Kitchen & Bathroom Fixtures > Bathroom Fixtures > Bath & Shower Taps"),
+    (("garden", "tap"), "Home & Garden > Garden & Outdoor Living > Garden Watering & Irrigation Supplies > Garden Taps"),
+)
+
+
+# Titles that CONTAIN a device phrase but are actually accessories or a
+# different device ("SMART TV REMOTE CONTROL", "Smart TV Box", a projector
+# "for Smart TV") - any of these words in the title vetoes the phrase
+# override and lets the normal stages decide (2026-08-10, found by the
+# category correctness scan on its first pass).
+TITLE_PHRASE_VETO = {
+    "remote", "control", "bracket", "mount", "stand", "strip", "light",
+    "backlight", "sticker", "cover", "case", "protector", "cable", "box",
+    "projector", "soundbar", "aerial", "antenna",
+    # phones/laptops/tablets/taps accessory words (2026-08-20)
+    "bag", "sleeve", "charger", "adapter", "holder", "battery", "keyboard",
+    "stylus", "pen", "washer", "cartridge", "aerator", "hose", "connector",
+}
+
+
+def title_phrase_category(title):
+    """The category a hand-curated title phrase dictates, or None."""
+    seq = [_stem(w) for w in re.findall(r"\w+", str(title).lower())]
+    if TITLE_PHRASE_VETO & set(seq):
+        return None
+    for phrase, path in TITLE_PHRASE_CATEGORIES:
+        n = len(phrase)
+        if n <= len(seq) and any(tuple(seq[i:i + n]) == phrase for i in range(len(seq) - n + 1)):
+            return path
+    return None
+
+
+def _to_float(value):
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _formula_priced(price, cost, ship, fee_rule, profit_override=None, fee_override=None):
+    """True when `price` is what our formula would have set at this cost -
+    under the flat 20% model, the category tier, or the row's own
+    percentage overrides - i.e. the automation set it, not a person. Both
+    fee models count: the current one (commission plus the VAT OnBuy adds to
+    it) and the one in force 2026-09-17 .. 2026-10-07 (commission + 1.5
+    points), so a price written yesterday is still the automation's own today."""
+    if price <= 0 or cost <= 0:
+        return False
+    total = cost + ship
+    candidates = []
+    for _legacy in (False, True):
+        candidates.append(pricing.calculate_selling_price(cost, ship, platform_fee_percent=pricing.PLATFORM_FEE_PERCENT,
+                                                          legacy=_legacy))
+        if fee_rule is not None:
+            candidates.append(pricing.calculate_selling_price(cost, ship, fee_rule=fee_rule, legacy=_legacy))
+        # Prices set under a band schedule that has since changed (e.g. the
+        # above-GBP-100 profit cut, 2026-09-11) are still the automation's own.
+        for _old in pricing.legacy_profit_percents(total, rule=fee_rule):
+            candidates.append(pricing.price_for_profit(total, _old, platform_fee_percent=pricing.PLATFORM_FEE_PERCENT,
+                                                       legacy=_legacy))
+            if fee_rule is not None:
+                candidates.append(pricing.price_for_profit(total, _old, rule=fee_rule, legacy=_legacy))
+        if profit_override is not None or fee_override is not None:
+            profit = profit_override if profit_override is not None else pricing.profit_percent(total)
+            if fee_override is not None:
+                candidates.append(pricing.price_for_profit(total, profit, platform_fee_percent=fee_override, legacy=_legacy))
+            else:
+                candidates.append(pricing.price_for_profit(total, profit, rule=fee_rule, legacy=_legacy))
+    return any(abs(c - price) < 0.011 for c in candidates)
+
+
+def _pct_value(cell, hi=100):
+    """A percentage typed in a sheet cell ("12", "12.5", "12.5%"), or None.
+    hi caps what counts as sane: a fee at or past 100% can never price, a
+    profit legitimately can (cheap items run 80%+, and a manual 150% is a
+    valid override)."""
+    s = str(cell if cell is not None else "").replace("%", "").replace(",", "").strip()
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v if 0 <= v < hi else None
+
+
+def resolve_pct_cell(cell, auto_values, mirror, hi=100):
+    """The manual override in a Fee % / Profit % cell, or None when the
+    cell is the automation's own. The automation's own = blank, or matching
+    (within rounding) a value the automation computes now or last wrote
+    (the mirror; overrides are never stored there, so a typed number stays
+    recognised as an override run after run). Anything else was typed by a
+    person: it feeds the formula and is never overwritten (user policy
+    2026-09-09).
+
+    The mirror holds WHOLE numbers (GTV's Postgres columns are integer-typed)
+    while the sheet shows two decimals - the 16.50 every 15% category shows
+    (nominal + the 1.5-point uplift), a tiered category's blend - so a cell
+    within half a point of the mirror's number is the automation's own too.
+    Without that every Fee % cell was read as an override from 2026-09-17 to
+    2026-10-02 and priced as a flat fee plus the uplift a SECOND time."""
+    typed = _pct_value(cell, hi)
+    if typed is None:
+        return None
+    if any(v is not None and abs(typed - v) < 0.05 for v in auto_values):
+        return None
+    stored = _pct_value(mirror, hi)
+    if stored is not None and abs(typed - stored) <= 0.5 + 1e-9:
+        return None
+    return typed
+
+
+def _fee_cell_auto_values(fee_rule, price):
+    """Every Fee % the automation itself puts in the cell for this row: the
+    category's nominal rates (what it showed before any uplift), those rates
+    as it shows them now (commission plus the VAT OnBuy adds: 15 -> 18.00) and
+    as it showed them 2026-09-17 .. 2026-10-07 (nominal + 1.5: 16.50), and the
+    effective rate at the row's current price under either model (a tiered
+    category blends its two rates, a very cheap item pays the minimum fee).
+    Anything else typed there is a person's override."""
+    if fee_rule is not None:
+        nominal = [fee_rule.lower_pct] + ([fee_rule.upper_pct] if fee_rule.upper_pct is not None else [])
+    else:
+        nominal = [float(pricing.PLATFORM_FEE_PERCENT)]
+    values = list(nominal)
+    for _legacy in (False, True):
+        values += [pricing.effective_rate(v, legacy=_legacy) for v in nominal]
+        # ...and the flat fallback's own display (20 -> 24.00, or 21.50 then): a row that was priced flat and
+        # categorised later still shows it, and nobody types it by hand.
+        values.append(pricing.effective_rate(float(pricing.PLATFORM_FEE_PERCENT), legacy=_legacy))
+        if price and price > 0:
+            values.append(pricing.effective_fee_percent(price, fee_rule, legacy=_legacy))
+    return values
+
+
+def _misread_fee_priced(price, cost, ship, fee_cell, profit_override=None, fee_rule=None):
+    """True when `price` is what the sync computed while it MISREAD this row's
+    Fee % cell (2026-09-17 .. 2026-10-02: the automation's own effective-fee
+    display, e.g. 16.50, taken for a manual override and priced as a flat fee
+    of cell + the uplift again): the profit on cost + shipping retained after
+    that inflated fee. Such a price is the automation's own, so it follows
+    the corrected formula down instead of being frozen by the never-lower
+    rule."""
+    if price <= 0 or cost <= 0 or fee_cell is None:
+        return False
+    total = cost + ship
+    # The profit that explains the price is the one the formula will use: the row's own override when it has
+    # one (a price set at the band's profit does not belong to a row whose cell now says something else - it
+    # would be dragged down to that cell's price), else the band's and the superseded schedules'.
+    if profit_override is not None:
+        profits = [profit_override]
+    else:
+        profits = ([pricing.profit_percent_for(total, rule=fee_rule)]
+                   + list(pricing.legacy_profit_percents(total, rule=fee_rule)))
+    # The misread priced under the fee model of its time (cell + 1.5 points), so it is recognised under that one.
+    return any(abs(pricing.price_for_profit(total, p, platform_fee_percent=fee_cell, legacy=True) - price) < 0.011
+               for p in profits)
+
+
+def _pct_text(value):
+    """A percentage as the sheet shows it: two decimals ("20.00"), more only where the value needs them."""
+    whole, _, frac = f"{value:.6f}".rstrip("0").partition(".")
+    return f"{whole}.{frac.ljust(2, '0')}"
+
+
+def _shown_profit(price, total_cost, fee_rule, fee_override):
+    """The Profit % to show for a price above the formula (user 2026-10-07): the profit that price REALLY earns after
+    OnBuy's commission, to as many decimals as it takes for the cell to price back to exactly that price (two
+    normally) - so even a cell that were ever read as a typed override would reproduce the price to the penny."""
+    exact = pricing.effective_profit_percent(price, total_cost, fee_rule, platform_fee_percent=fee_override)
+    for digits in (2, 3, 4, 5, 6):
+        shown = round(exact, digits)
+        if abs(pricing.price_for_profit(total_cost, shown, rule=fee_rule, platform_fee_percent=fee_override) - price) < 0.005:
+            return shown
+    return round(exact, 6)
+
+
+def _cell_number(value):
+    """A sheet cell as a number ("89.99", "£89.99", "1,250.50", "89,99", 89.99), or None when it is blank or not a number."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value if value is not None else "").replace("£", "").replace("%", "").replace(" ", "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d+,\d{1,2}", s):          # "89,99": a decimal comma
+        s = s.replace(",", ".")
+    try:
+        return float(s.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _cells_differ(a, b):
+    """True when two cell values are different numbers (or different text); blank equals blank."""
+    na, nb = _cell_number(a), _cell_number(b)
+    if na is not None and nb is not None:
+        return abs(na - nb) > 0.0049
+    return str(a if a is not None else "").strip() != str(b if b is not None else "").strip()
+
+
+def drop_edited_cells(updates, guarded, snap_sku, snap_value, fresh_sku, fresh_value):
+    """The run flushes ALL its sheet writes in one sweep at the very end, and an
+    Amazon run lasts an hour or more - so a price (or a Profit % / Fee %
+    override) typed into the sheet WHILE a run was in progress was written over
+    with the value the run had worked out from its start-of-run snapshot (the
+    user's manual price "overwriting again and again", 2026-10-07). This drops
+    every write to a guarded column whose cell no longer holds what the run
+    read at its start: somebody edited it, and the edit wins.
+
+    updates: [{"range": "AB123", "values": [[v]]}], row numbers as of the
+    snapshot. guarded: {column letters: column name}. snap_sku: the SKU column
+    at run start (index 0 = row 1). snap_value(name, row) / fresh_value(name,
+    row): the cell as read at run start / now (row = the row the SKU has NOW for
+    fresh_value). Returns (kept, dropped): dropped = [(sku, column name, the
+    cell's current value)]. A write whose SKU moved or is duplicated is kept
+    here - _remap_row_writes decides about it."""
+    pos = {}
+    for _idx, _val in enumerate(fresh_sku):
+        _key = str(_val).replace(",", "").strip()
+        if _idx and _key:
+            pos.setdefault(_key, []).append(_idx + 1)
+    kept, dropped = [], []
+    for _u in updates:
+        _rng = str(_u["range"])
+        _head = _rng.rstrip("0123456789")
+        _name = guarded.get(_head)
+        try:
+            _row_n = int(_rng[len(_head):])
+        except ValueError:
+            _row_n = 0
+        if _name is None or _row_n <= 0:
+            kept.append(_u)
+            continue
+        _sku = str(snap_sku[_row_n - 1]).replace(",", "").strip() if _row_n - 1 < len(snap_sku) else ""
+        _where = pos.get(_sku) or []
+        if not _sku or len(_where) != 1:
+            kept.append(_u)
+            continue
+        _now = fresh_value(_name, _where[0])
+        if _cells_differ(snap_value(_name, _row_n), _now):
+            dropped.append((_sku, _name, _now))
+            continue
+        kept.append(_u)
+    return kept, dropped
+
+
+def decide_price(*, supplier, cost_price, shipping_cost, fee_rule, existing_price, fee_cell, profit_cell, prev,
+                 sheet_cost=0.0, sheet_ship=0.0, prev_fee_rule=None):
+    """The row's selling price and how it was reached - the pricing block of
+    the sync loop, pulled out so it can be tested. `prev` is what the
+    Supabase mirror last saw for the SKU. Returns a dict: band_now,
+    profit_override and fee_override (the percentages in play), formula_price,
+    selling_price, how ("amazon" = re-derived from the current cost both ways,
+    "follows" = a price the automation set followed the formula DOWN, "kept" =
+    max(existing, formula), "manual" = an Amazon row whose price a person raised
+    above the formula, kept) and misread (the existing price came from the Fee %
+    misread of 2026-09-17..10-02), and profit_shown (the Profit % to write). sheet_cost / sheet_ship are the row's own Cost /
+    Shipping cells (written in the same batch as the price, so they name the cost
+    the price was set at even when the mirror is missing); prev_fee_rule is the
+    rule of the category the mirror last saw (a price set before a recategorisation)."""
+    total_cost = cost_price + shipping_cost
+    prev_cost, prev_ship = _to_float(prev.get("Cost Price (£)")), _to_float(prev.get("Shipping Cost (£)"))
+    # Fee % / Profit % cells: normally the automation's own report, but
+    # a different number typed there is a per-row override - it drives
+    # the formula and is never overwritten (resolve_pct_cell).
+    band_now = pricing.profit_percent_for(total_cost, rule=fee_rule) if cost_price > 0 else None
+    prev_total = prev_cost + prev_ship
+    band_prev = pricing.profit_percent_for(prev_total, rule=fee_rule) if prev_total > 0 else None
+    # The displaced cost-band values stay in the auto list: a Profit %
+    # cell the automation wrote BEFORE a price range applied (e.g.
+    # "40") must not be misread as a manual override, or the row would
+    # freeze at the old profit forever.
+    base_now = pricing.profit_percent(total_cost) if cost_price > 0 else None
+    base_prev = pricing.profit_percent(prev_total) if prev_total > 0 else None
+    # 0 is the automation's own placeholder (it writes 0.00 for a row with no cost, and a restocked row still
+    # shows it): never an intended price - read as a 0% override it priced rows at no profit at all.
+    # A superseded schedule's profit for this cost is the automation's own too: a cell written under an older
+    # band (20 before the temporary 15, 40 before the 09-11 schedule) must not turn into a manual override just
+    # because the band moved and the mirror could not vouch for it (the mirror prefetch used to fail for big
+    # batches, so ~1,000 Amazon rows per store stuck at 20.00 while the band was 15).
+    old_bands = ((list(pricing.legacy_profit_percents(total_cost, rule=fee_rule)) if cost_price > 0 else [])
+                 + (list(pricing.legacy_profit_percents(prev_total, rule=fee_rule)) if prev_total > 0 else []))
+    profit_override = resolve_pct_cell(profit_cell, [band_now, band_prev, base_now, base_prev, 0.0] + old_bands,
+                                       prev.get("Profit %"), hi=500)
+    fee_override = resolve_pct_cell(fee_cell, _fee_cell_auto_values(fee_rule, existing_price), prev.get("Fee %"))
+    profit_used = profit_override if profit_override is not None else (band_now or 0)
+    if cost_price <= 0:
+        formula_price = 0.0
+    elif fee_override is not None:
+        formula_price = pricing.price_for_profit(total_cost, profit_used, platform_fee_percent=fee_override)
+    else:
+        formula_price = pricing.price_for_profit(total_cost, profit_used, rule=fee_rule)
+    # A price the automation set itself may follow the formula DOWN when
+    # the commission assumption drops (category mode) or the row's own
+    # percentages are lowered; a price a person set above the formula is
+    # never lowered. "Set by the automation" = equals what the formula
+    # produced at this cost, or at the cost the mirror last saw, under
+    # any fee model this row has been through (2026-09-09) - including the
+    # inflated one of the Fee % misread (2026-10-02).
+    fee_typed = _pct_value(fee_cell)
+    misread = (fee_override is None and fee_typed is not None
+               and (_misread_fee_priced(existing_price, cost_price, shipping_cost, fee_typed, profit_override, fee_rule)
+                    or _misread_fee_priced(existing_price, prev_cost, prev_ship, fee_typed, profit_override, fee_rule)))
+    # The costs (and category rules) the current price may have been set under: the one just fetched, the mirror's
+    # last-seen cost, and the cost cell the sheet carries - each under this row's rule and the previous category's.
+    _cost_bases = [(cost_price, shipping_cost), (prev_cost, prev_ship)]
+    if sheet_cost and sheet_cost > 0:
+        _cost_bases.append((sheet_cost, sheet_ship))
+    _rules = [fee_rule] + ([prev_fee_rule] if prev_fee_rule is not None and prev_fee_rule is not fee_rule else [])
+    automation_set = misread or any(
+        _formula_priced(existing_price, _c, _s, _r, profit_override, fee_override)
+        for _c, _s in _cost_bases for _r in _rules)
+    reprice_basis = (fee_rule is not None or profit_override is not None or fee_override is not None
+                     or bool(pricing.legacy_profit_percents(total_cost, rule=fee_rule)) or misread)
+    if supplier == "Amazon" and formula_price > 0:
+        # Amazon rows re-derive from the CURRENT fetched cost - down as
+        # well as up (user policy 2026-09-18): a price the automation set
+        # follows Amazon's price instead of ratcheting at max(). But a price
+        # a PERSON raised above the formula is theirs (user 2026-10-07: "the
+        # manual increase is overwritten again and again"): a price above
+        # the formula that no formula produced - at the fetched cost, the
+        # mirror's, the sheet's own cost cell, under either fee model or
+        # either category - is kept as a floor, exactly like the eBay tab.
+        # It lasts until the formula overtakes it (cost rises) or the cell is
+        # lowered / cleared. Profit % / Fee % cell overrides still drive the
+        # formula itself, and a row whose fetch failed never reaches this line.
+        if existing_price > formula_price + 0.011 and not automation_set:
+            how, selling_price = "manual", existing_price
+        else:
+            how, selling_price = "amazon", formula_price
+    elif reprice_basis and automation_set and 0 < formula_price < existing_price:
+        how, selling_price = "follows", formula_price
+    else:
+        how, selling_price = "kept", max(existing_price, formula_price)
+    # What the Profit % cell and the mirror show (None = leave the cell alone: a typed override stays exactly as typed,
+    # a row without a cost has nothing to show): the band's profit while the row is priced by the formula, the profit
+    # the price REALLY earns after OnBuy's commission once it sits above the formula. The mirror stores it too, which
+    # is how the next run knows the cell is the automation's own and not a typed override.
+    profit_shown = None
+    if profit_override is None and cost_price > 0:
+        profit_shown = band_now
+        if selling_price > formula_price + 0.011:
+            profit_shown = _shown_profit(selling_price, total_cost, fee_rule, fee_override)
+    return {"band_now": band_now, "profit_override": profit_override, "fee_override": fee_override,
+            "formula_price": formula_price, "selling_price": selling_price, "how": how, "misread": misread,
+            "profit_shown": profit_shown}
+
+
+def _shipping_value(cell):
+    """The delivery cost a Shipping Cost (£) cell stands for: its number
+    ("3.99", "£3.99", 3.99), or 0 for blank, "free" and any other text (a
+    text cell used to crash the run inside float())."""
+    s = str(cell if cell is not None else "").strip().lower().replace("£", "").replace(" ", "")
+    if not s:
+        return 0.0
+    if re.fullmatch(r"\d+,\d{1,2}", s):          # "3,99": a decimal comma
+        s = s.replace(",", ".")
+    try:
+        value = float(s.replace(",", ""))
+    except ValueError:
+        return 0.0
+    return value if 0 < value < 1000 else 0.0      # negative, NaN, infinity or absurd = none
+
+
+def shipping_cell_update(quote, current):
+    """What to write into a row's Shipping Cost (£) cell for eBay's quote, or None to leave the cell alone (user
+    2026-10-03: the delivery cost is for the items whose eBay link states an exact fee, "not for all"). A stated fee
+    is written as a number; FREE delivery writes nothing into a blank cell - a cell still holding an earlier fee
+    becomes "free" so the cost base stops carrying it; no exact quote (None) never touches the cell."""
+    if quote is None:
+        return None
+    now = _shipping_value(current)
+    if quote == 0:
+        return "free" if now > 0 else None
+    return quote if abs(now - quote) >= 0.005 else None
+
+
+def ebay_shipping_cost(item):
+    """What eBay's listing states to deliver this item to a UK buyer, from the
+    item the sync already fetched (shippingOptions - no extra API call): the
+    cheapest delivered option's EXACT fee in GBP, 0.0 for free delivery, None
+    when eBay gave no exact figure (no options, a CALCULATED fee that depends
+    on the buyer's postcode, another currency). Collection in person is not
+    delivery and is skipped."""
+    best = None
+    for opt in (item or {}).get("shippingOptions") or []:
+        if not isinstance(opt, dict):
+            continue
+        kind = f"{opt.get('type') or ''} {opt.get('shippingServiceCode') or ''}".lower()
+        if "pickup" in kind or "collect" in kind:
+            continue
+        cost_type = str(opt.get("shippingCostType") or "").strip().upper()
+        if cost_type and cost_type != "FIXED":
+            continue                    # calculated for a postcode, not a figure written on the listing
+        cost = opt.get("shippingCost") or {}
+        if str(cost.get("currency") or "GBP").upper() != "GBP":
+            continue
+        try:
+            value = float(cost.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if value != value or value < 0:
+            continue
+        best = value if best is None else min(best, value)
+    return None if best is None else round(best, 2)
+
+
+def _quantile(values, q):
+    """The q-quantile (0..1) of a list of numbers; 0.0 for an empty list."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * q))]
+
+
+def carry_forward(fresh, stored, default=None):
+    """First non-None value wins - this run's value, else what Supabase
+    already had, else `default`.
+
+    `or` cannot be used for the OnBuy-tracking columns. Under the canonical
+    typed schema (2026-08-06: boolean / boolean / nullable timestamp, as on
+    the GTV store) PostgREST returns a stored boolean False as Python False
+    - falsy but perfectly valid - so `or` falls straight past it to the
+    default and sends "" into a boolean column, which 400s the ENTIRE
+    batch (22P02) and loses the database mirror for every row in it
+    (GTV, ~25% of runs, fixed 2026-08-04). Safe against the pre-migration
+    text schema too: "FALSE" is a normal string there and NULL is accepted
+    (canary-verified per store before this port).
+    """
+    if fresh is not None:
+        return fresh
+    if stored is not None:
+        return stored
+    return default
+
+
+def is_valid_gtin(code):
+    """True if `code` is a real barcode by the GS1 check-digit standard used
+    for UPC-A/EAN-8/EAN-13/GTIN-14 (all the same algorithm, just different
+    lengths). Being all-digits and the right length isn't enough - OnBuy
+    validates the actual check digit and rejects create_product outright
+    with "not a valid product code" otherwise, which happened for two SKUs
+    that were numeric and 12 digits long but not real barcodes."""
+    if not code.isdigit() or len(code) not in (8, 12, 13, 14):
+        return False
+    # GS1 reserves the "5" number system of 12-digit UPCs for discount
+    # coupons - such codes pass the check digit but can never be product
+    # codes, and OnBuy's GS1 registry check rejects them ("not a valid
+    # product code": 23 YRA + 74 Arden feed rows, 2026-07-28). A 13-digit
+    # code starting "05" is the same coupon number zero-padded; 13-digit
+    # codes starting "50" (GS1 UK) remain perfectly valid.
+    if (len(code) == 12 and code[0] == "5") or (len(code) == 13 and code.startswith("05")):
+        return False
+    body, check_digit = code[:-1], code[-1]
+    total = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body)))
+    return str((10 - total % 10) % 10) == check_digit
+
+
+def sku_numeric_part(sku):
+    """The digits of the SKU ARE the product's barcode (user policy
+    2026-07-13, both stores): a SKU may carry non-digit decoration around
+    the barcode ("GTV-5012345678900") and everything validated or sent as
+    an EAN/UPC uses only the digits. The decoration must not itself contain
+    digits - a "-1" style suffix corrupts the barcode and will (correctly)
+    fail the check-digit test."""
+    return re.sub(r"\D", "", str(sku or ""))
+
+
+# Values eBay sellers sometimes put in the "Brand" aspect that are not
+# actually a brand name - typically someone answering a yes/no-style prompt
+# literally ("Branded") rather than naming the brand. User's explicit policy
+# (2026-07-04): normalize all of these to "Unbranded" rather than pass a
+# placeholder through as if it were a real brand.
+_NON_BRAND_VALUES = {"branded", "unbranded", "no brand", "none", "n/a", "na", "generic", ""}
+
+
+# A brand block is OnBuy's verdict on one brand on one day, not a life
+# sentence on the row. Rows have sat blocked for weeks on brands the
+# platform was accepting on neighbouring rows the whole time: the verdict was re-read
+# from the Supabase mirror every run, the row was never pushed again to
+# test it, and the mirror is never rewritten for a blocked row - so the
+# skip outlived the refusal with nothing able to clear it. The flag now
+# records WHICH brand was refused and WHEN, and lifts when either stops
+# applying.
+BRAND_BLOCK_RE = re.compile(
+    r"BRAND BLOCKED(?: \((\d{4}-\d{2}-\d{2})\))? - OnBuy says the brand '([^']*)'", re.I)
+BRAND_BLOCK_PHRASE = "supplied brand is owned by another seller"
+BRAND_BLOCK_RETRY_DAYS = int(os.getenv("BRAND_BLOCK_RETRY_DAYS") or "7")
+
+
+def brand_block_state(statuses, brand, today, retry_days=BRAND_BLOCK_RETRY_DAYS):
+    """(skip this row?, the date to stamp on the flag).
+
+    `statuses` are the row's Sync Status values, most trustworthy first -
+    the sheet, which is the only place a blocked row is ever written, then
+    the mirror, which keeps OnBuy's original wording indefinitely. The
+    first flag found decides, so the sheet's dated flag governs and the
+    mirror's undated copy cannot immortalise a skip.
+
+    A block lifts when the Brand cell no longer holds the refused brand,
+    or once the verdict is retry_days old. While it stands, the ORIGINAL
+    date is returned so re-flagging does not keep resetting the clock."""
+    for status in statuses:
+        m = BRAND_BLOCK_RE.search(str(status or ""))
+        if not m:
+            continue
+        stamped, refused = m.group(1), (m.group(2) or "").strip()
+        if refused.casefold() != str(brand or "").strip().casefold():
+            return False, today          # brand corrected since the refusal
+        if not stamped:
+            return True, today           # flag predates the stamp - date it now
+        try:
+            first_seen = datetime.strptime(stamped, "%Y-%m-%d").date()
+        except ValueError:
+            return True, today
+        if (today - first_seen).days >= retry_days:
+            return False, today          # verdict is stale - let OnBuy re-judge
+        return True, first_seen
+    if any(BRAND_BLOCK_PHRASE in str(s or "") for s in statuses):
+        return True, today               # OnBuy's raw refusal, first sighting
+    return False, today
+
+
+def normalize_brand(brand):
+    if str(brand).strip().lower() in _NON_BRAND_VALUES:
+        return "Unbranded"
+    # OnBuy 400s "brand name must be greater than or equal to 2 characters
+    # after processing" (a lone "." from eBay, 2026-08-21): a value with
+    # fewer than 2 letters/digits is not a brand.
+    if len(re.sub(r"[^A-Za-z0-9]", "", str(brand))) < 2:
+        return "Unbranded"
+    return brand
+
+
+def dedupe_rows_by_sku(rows, what):
+    """Postgres/PostgREST rejects a whole bulk upsert if two rows in the same
+    call share the same SKU (the conflict target) - "ON CONFLICT DO UPDATE
+    command cannot affect row a second time". That only happens from a real
+    duplicate SKU somewhere in the Sheet (e.g. a copy-pasted row, or the same
+    value with stray whitespace), so keep the last occurrence and log which
+    SKU(s) need fixing in the Sheet, rather than losing the whole batch."""
+    deduped = {}
+    duplicates = set()
+    for row in rows:
+        sku = row.get("SKU")
+        if sku in deduped:
+            duplicates.add(sku)
+        deduped[sku] = row
+    if duplicates:
+        logger.warning(
+            "%s: %d row(s) dropped due to duplicate SKU(s) in the Sheet - please fix these SKUs: %s",
+            what, len(duplicates), ", ".join(sorted(duplicates)),
+        )
+    return list(deduped.values())
+
+
+_RED = {"red": 0.96, "green": 0.8, "blue": 0.8}
+_WHITE = {"red": 1, "green": 1, "blue": 1}
+
+
+def row_highlight_request(sheet_id, row_index, num_cols, active):
+    """Sheets API repeatCell request: red background for an inactive
+    (stock=0) row, cleared back to white when it's active again."""
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": row_index - 1,
+                "endRowIndex": row_index,
+                "startColumnIndex": 0,
+                "endColumnIndex": num_cols,
+            },
+            "cell": {"userEnteredFormat": {"backgroundColor": _WHITE if active else _RED}},
+            "fields": "userEnteredFormat.backgroundColor",
+        }
+    }
+
+
+def tokenize(text):
+    return set(re.findall(r"\w+", str(text).lower()))
+
+
+# Words too generic to say anything about a product's category - they appear
+# in almost every eBay title/description ("premium quality", "free shipping",
+# "brand new", "UK stock"...) and were a major source of wrong matches.
+_CATEGORY_STOPWORDS = {
+    "and", "the", "for", "with", "from", "this", "that", "your", "our", "you",
+    "are", "not", "new", "brand", "pack", "pcs", "set", "free", "shipping",
+    "delivery", "returns", "quality", "premium", "high", "best", "top", "hot",
+    "sale", "gift", "uni", "unisex", "universal", "portable", "durable",
+    "stock", "fast", "included", "includes", "colour", "color", "size", "uk",
+    "usa", "use", "product", "products", "item", "items", "piece",
+    "pieces", "note", "please", "buy", "seller", "customer", "support",
+    "service", "day", "days", "one", "two", "three", "all", "small", "large",
+    "mini", "big", "medium", "extra", "travel",
+}
+
+# Category subtrees that share everyday vocabulary with ordinary physical
+# products and kept stealing them in testing (on the Arden store, where this
+# matcher was rewritten first): a microwave FOOD COVER matched "Cooking
+# Books" and "Kitchen Role Play Toys", a SLEEP MASK matched "BDSM Masks &
+# Blindfolds". Each subtree is only allowed when the product explicitly uses
+# one of its own words (stemmed forms, matching category_match_tokens'
+# output - hence "dres" for dress).
+_GUARDED_SUBTREES = (
+    ("books, movies & music",
+     {"book", "dvd", "blu", "vinyl", "movie", "film", "music", "album", "magazine", "novel"}),
+    ("health & beauty > sex & adult",
+     {"adult", "bdsm", "erotic", "bondage", "sex"}),
+    ("toys & games > pretend play & fancy dress",
+     {"toy", "pretend", "costume", "fancy", "dres", "kid", "child", "children"}),
+)
+
+
+def _stem(word):
+    # Bridge singular/plural ("adapter" <-> "Adapters", "watch" <-> "Watches")
+    # without a real stemmer. The -es forms matter: the naive "drop one s"
+    # rule turned "Watches" into "watche", so a Type of "Smart Watch" could
+    # never match the "Smart Watches" leaf and landed in "Smart Watch Cases"
+    # instead (2026-08-03). Order matters - most specific ending first.
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"            # batteries -> battery
+    if len(word) > 4 and word.endswith(("ches", "shes", "sses", "xes", "zes")):
+        return word[:-2]                  # watches -> watch, boxes -> box
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]                  # adapters -> adapter
+    return word
+
+
+def category_match_tokens(text):
+    """Meaningful whole-word tokens for category matching: 3+ characters,
+    not a stopword, not a bare number, plural-normalized."""
+    # "3d" is kept although it is 2 characters: without it "3D Printer" is a plain "printer" and lands in Computing & Gaming >
+    # Printers (7% commission) instead of 3D Printing > 3D Printers (15%, what OnBuy charges) - Makstore orders T6QR55D / T6Q6FJQ.
+    return {_stem(w) for w in tokenize(text)
+            if (len(w) >= 3 or w == "3d") and w not in _CATEGORY_STOPWORDS and not w.isdigit()}
+
+
+def clean_category(cat):
+    if not cat:
+        return ""
+    cat = str(cat).replace("\n", " ").strip()
+    cat = re.sub(r"\s+", " ", cat).strip()
+    return cat
+
+
+def to_jpg(url):
+    if not url:
+        return ""
+    url = re.sub(r"\.webp.*$", ".jpg", url)
+    url = re.sub(r"\.(png|jpeg).*?$", ".jpg", url)
+    return url
+
+
+def empty_ebay_response(reason=""):
+    """The blank answer for an unavailable item. `reason` (optional) says why - removed | ended | out_of_stock | no_price | no_availability |
+    bad_link - and rides along as ebay_data["reason"] for purge_dead_rows.py; the sync itself never reads it."""
+    out = {
+        "stock": 0,
+        "price": 0,
+        "description": "",
+        "main_image": "",
+        "additional_images": [],
+        "title": "",
+        "brand": "",
+        "product_code": "",
+        "condition": "",
+    }
+    if reason:
+        out["reason"] = reason
+    return out
+
+
+_BARCODE_ASPECT_NAMES = ("EAN", "GTIN", "UPC", "ISBN")
+
+
+def extract_product_code(data):
+    """Look for a real barcode (EAN/GTIN/UPC/ISBN) in eBay's item aspects -
+    same array already parsed for Brand, no extra API call. Returns "" when
+    the listing has no barcode specified. This is purely informational (the
+    Sheet/Supabase "EAN" column) - it is NOT what gets sent to OnBuy as the
+    product code. OnBuy uses the seller's own SKU for that instead (see the
+    main loop), since the eBay item ID looked plausible as a fallback here
+    but isn't a real barcode and got create_product rejected outright with
+    "not a valid product code" when tried.
+    """
+    for aspect in data.get("localizedAspects", []):
+        name = aspect.get("name", "").strip().upper()
+        if name in _BARCODE_ASPECT_NAMES:
+            values = aspect.get("value", "")
+            raw = values[0] if isinstance(values, list) else values
+            digits = re.sub(r"\D", "", str(raw))
+            if digits:
+                return digits
+    return ""
+
+
+# ================= EBAY TOKEN =================
+def get_ebay_token():
+    def _do_token():
+        encoded = base64.b64encode(f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()).decode()
+        resp = requests.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            headers={"Authorization": f"Basic {encoded}", "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"},
+            timeout=30,
+        )
+        raise_for_status(resp, what="ebay token")
+        token = resp.json().get("access_token")
+        if not token:
+            raise AuthError("ebay token response missing access_token")
+        return token
+
+    try:
+        return with_retry(_do_token, what="ebay token", max_attempts=3)
+    except (AuthError, PermanentError) as exc:
+        logger.error("eBay authentication failed: %s", exc)
+        return None
+    except Exception as exc:
+        logger.error("eBay authentication failed after retries: %s", exc)
+        return None
+
+
+def ebay_calls_remaining(token):
+    """Calls left in this application's daily Browse window, read from eBay's
+    Developer Analytics (None when unreadable - a guard must never kill the
+    run). The window resets at 07:00 UTC; a batch that outruns it earns a 429
+    on every remaining row."""
+    try:
+        resp = requests.get(
+            "https://api.ebay.com/developer/analytics/v1_beta/rate_limit/",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"api_context": "buy", "api_name": "browse"}, timeout=30)
+        if resp.status_code != 200:
+            return None
+        for rl in resp.json().get("rateLimits", []):
+            for res in rl.get("resources", []):
+                if res.get("name") == "buy.browse":
+                    for rate in res.get("rates", []):
+                        if rate.get("timeWindow") == 86400 and rate.get("remaining") is not None:
+                            return int(rate["remaining"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not read eBay's remaining call allowance (%s) - sizing from the budget only", exc)
+    return None
+
+
+ITEM_GROUP_ERROR_ID = 11006  # "The legacy Id is invalid... use get_items_by_item_group"
+
+
+def _is_item_group_error(resp):
+    try:
+        errors = resp.json().get("errors", [])
+    except ValueError:
+        return False
+    return any(e.get("errorId") == ITEM_GROUP_ERROR_ID for e in errors)
+
+
+def _fetch_item_group_as_item(item_group_id, token):
+    """Some eBay listings are multi-variation ("item group") listings - e.g.
+    a listing with size/color options - which get_item_by_legacy_id rejects
+    with errorId 11006, pointing at this endpoint instead.
+
+    item_group_id here is the specific legacy item ID the Sheet row's URL
+    actually linked to (that's what triggered the 11006 error in the first
+    place), so match it back against the group's returned items and use that
+    *exact* variation's own title/description/images/price. Only falls back
+    to the first item in the group if no exact match is found - previously
+    this always used the first item regardless of which variation was
+    linked, which is the likely cause of unrelated rows appearing to share
+    one variation's description (they'd all resolve to whichever variation
+    the API happened to list first for that group).
+    """
+    resp = requests.get(
+        "https://api.ebay.com/buy/browse/v1/item/get_items_by_item_group",
+        headers={"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB"},
+        params={"item_group_id": item_group_id},
+        timeout=20,
+    )
+    if resp.status_code == 404:
+        # "The specified item group was not found" (errorId 11002): the multi-variation listing is gone - the same
+        # real answer a plain item gets with a 404 (the caller reports it as removed), not a fetch failure. As a
+        # failure it left the row's stale stock live and ended every sync red.
+        return None
+    raise_for_status(resp, what=f"ebay item group {item_group_id}")
+    group_data = resp.json()
+
+    items = group_data.get("items", [])
+    if not items:
+        return None
+
+    chosen = next(
+        (item for item in items if str(item.get("legacyItemId") or "") == str(item_group_id)),
+        None,
+    )
+    if chosen is not None:
+        logger.info("Item %s is a multi-variation listing - using its own linked variation", item_group_id)
+    else:
+        chosen = items[0]
+        logger.warning(
+            "Item %s is a multi-variation listing but its own variation wasn't found among "
+            "the %d returned - falling back to variation %s, title/description/price may not "
+            "match what this row's link actually points to",
+            item_group_id, len(items), chosen.get("legacyItemId") or chosen.get("itemId"),
+        )
+
+    description = chosen.get("description")
+    if not description:
+        for common in group_data.get("commonDescriptions", []):
+            if chosen.get("itemId") in common.get("itemIds", []):
+                description = common.get("description", "")
+                break
+    chosen["description"] = description or ""
+
+    return chosen
+
+
+# ================= EBAY FETCH =================
+def get_ebay_data(url, token):
+    """Returns (available, data). available=False with empty_ebay_response()
+    means eBay gave us a definitive "not available" answer (404 / no price /
+    out of stock) - a real signal, not a failure.
+
+    Raises TransientError/PermanentError if the fetch itself failed after
+    retries. Callers MUST NOT treat that the same as "removed" - the previous
+    version's bare `except Exception` did exactly that and zeroed live
+    listings on ordinary network blips.
+    """
+    match = re.search(r"/itm/(\d+)", url)
+    if not match:
+        return False, empty_ebay_response("bad_link")
+    item_id = match.group(1)
+
+    def _do_fetch():
+        resp = requests.get(
+            "https://api.ebay.com/buy/browse/v1/item/get_item_by_legacy_id",
+            headers={"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB"},
+            params={"legacy_item_id": item_id},
+            timeout=20,
+        )
+        if resp.status_code == 404:
+            return None  # confirmed removed - a real signal, not an error
+        if resp.status_code == 400 and _is_item_group_error(resp):
+            return _fetch_item_group_as_item(item_id, token)
+        raise_for_status(resp, what=f"ebay item {item_id}")
+        return resp.json()
+
+    data = with_retry(_do_fetch, what=f"ebay item {item_id}", max_attempts=3)
+
+    if data is None:
+        logger.info("REMOVED LISTING: %s", item_id)
+        return False, empty_ebay_response("removed")
+
+    # An itemEndDate in the past = the listing ENDED. eBay's own
+    # community confirms getItemByLegacyId can still answer with cached
+    # item data for ended listings (and estimatedAvailabilities can be
+    # null at random) - the 2026-09-21 oversell class. Ended = nothing
+    # to source from, whatever else the answer carries.
+    _end = str(data.get("itemEndDate") or "").strip()
+    if _end:
+        try:
+            if datetime.fromisoformat(_end.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                logger.info("LISTING ENDED %s: %s", _end[:10], item_id)
+                return False, empty_ebay_response("ended")
+        except ValueError:
+            pass
+
+    price_data = data.get("price", {}) or {}
+    price = float(price_data.get("value", 0) or 0)
+    if price <= 0:
+        logger.info("NO PRICE: %s", item_id)
+        return False, empty_ebay_response("no_price")
+
+    estimated = data.get("estimatedAvailabilities", [])
+    stock = 5
+    if not estimated:
+        # No availability block at all: eBay stopped vouching that the
+        # item is buyable. The old fall-through default of "available,
+        # stock 5" put two orders on a sold-out source (Makstore SKU
+        # 667179353513, 2026-09-21). Overselling is the costlier
+        # mistake, so absence = out of stock; price and content stay,
+        # and the row self-heals the moment the block returns.
+        logger.info("NO AVAILABILITY BLOCK (treated as out of stock): %s", item_id)
+        return False, empty_ebay_response("no_availability")
+    if estimated:
+        est = estimated[0]
+        status = est.get("estimatedAvailabilityStatus", "")
+        if status in ("OUT_OF_STOCK", "UNAVAILABLE"):
+            logger.info("OUT OF STOCK: %s", item_id)
+            return False, empty_ebay_response("out_of_stock")
+        stock = est.get("estimatedAvailableQuantity")
+        if not stock:
+            # eBay hides the exact count above a threshold - the listing
+            # shows "More than 10 available" and the API sends only
+            # availabilityThresholdType=MORE_THAN + the threshold, no
+            # quantity. Use that known floor ("at least 10") rather than
+            # a made-up number; never inflate past what eBay confirms -
+            # overselling is the costlier mistake.
+            if str(est.get("availabilityThresholdType") or "") == "MORE_THAN":
+                stock = est.get("estimatedAvailabilityThreshold") or 0
+    if not stock or stock <= 0:
+        stock = 5
+
+    html_description = sanitize_description(data.get("description", ""))
+
+    main_image = ""
+    if data.get("image"):
+        main_image = to_jpg(data["image"].get("imageUrl", ""))
+
+    additional_images = []
+    for img in data.get("additionalImages", []):
+        img_url = to_jpg(img.get("imageUrl", ""))
+        if img_url:
+            additional_images.append(img_url)
+
+    all_images = validate_images([main_image] + additional_images, max_images=11)
+    main_image = all_images[0] if all_images else ""
+    additional_images = all_images[1:11]
+
+    title = strip_emojis(data.get("title", ""))
+
+    brand = ""
+    for aspect in data.get("localizedAspects", []):
+        if aspect.get("name", "").lower() == "brand":
+            values = aspect.get("value", "")
+            brand = values[0] if isinstance(values, list) else values
+    brand = normalize_brand(brand)
+
+    product_code = extract_product_code(data)
+    condition = data.get("condition") or "New"
+
+    # eBay's structured "Type" item specific names the product class
+    # outright ("Air Fryer", "Foot File") even when a marketing title
+    # doesn't (user insight 2026-08-01: novelty-gift titles hide the
+    # product, but Type identifies it). Fallback: sellers often render
+    # the specifics into the description text as "Type: ...".
+    product_type = ""
+    for aspect in data.get("localizedAspects", []):
+        if aspect.get("name", "").strip().lower() in ("type", "product type", "item type"):
+            values = aspect.get("value", "")
+            product_type = str(values[0] if isinstance(values, list) else values).strip()
+            if product_type:
+                break
+    if not product_type:
+        m = re.search(r"(?i)\btype\s*:\s*(?:</?[a-z][^>]*>\s*)*([A-Za-z][A-Za-z &/-]{2,40})",
+                      str(data.get("description") or ""))
+        if m:
+            product_type = m.group(1).strip()
+
+    return True, {
+        "stock": stock,
+        "price": price,
+        "description": html_description,
+        "main_image": main_image,
+        "additional_images": additional_images,
+        "title": title,
+        "brand": brand,
+        "product_code": product_code,
+        "condition": condition,
+        "product_type": product_type,
+        # eBay's own delivery quote (None = not stated) - see ebay_shipping_cost / the pricing block.
+        "shipping_cost": ebay_shipping_cost(data),
+    }
+
+
+def main():
+    run_had_errors = False
+    fetch_failures = 0
+
+    # ================= GOOGLE SHEET =================
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    # Google's API throws intermittent 503s (5 crashed runs in the week of
+    # 2026-08-18) - one retry cycle rides them out.
+    spreadsheet = with_retry(lambda: client.open("Kidoomi_Full_Feed_Master"),
+                             what="sheet open", max_attempts=3)
+    sheet = spreadsheet.worksheet(SHEET_TAB) if SHEET_TAB else sheet_tabs.product_sheet(spreadsheet)
+    logger.info("Worksheet: %s", sheet.title)
+
+    # Header hygiene BEFORE reading the data: one stray space typed into a
+    # header cell ("SKU ") makes that whole column unreadable - row.get("SKU")
+    # returns None on every row - and a blanked A1 did exactly that on the
+    # YRA Full sheet on 2026-08-06. Strip every header name, and refuse to
+    # run at all on missing/duplicated critical headers: one clear email
+    # beats a run that half-works and flags every row. (Ported from the
+    # semi tier, where a deleted header row taught this on 2026-07-29.)
+    headers = [str(h).strip() for h in sheet.row_values(1)]
+    col_map = {col: idx + 1 for idx, col in enumerate(headers) if col}
+
+    required = ["SKU", "Supplier URL", "Title", "Status", "Last Checked Time"]
+    missing = [h for h in required if h not in col_map]
+    duplicates = sorted({h for h in headers if h and headers.count(h) > 1})
+    if missing or duplicates:
+        problems = []
+        if missing:
+            problems.append("missing header(s): " + ", ".join(missing))
+        if duplicates:
+            problems.append("duplicated header(s): " + ", ".join(duplicates))
+        message = ("The Sheet's header row (row 1) is broken - " + "; ".join(problems)
+                   + f". Row 1 currently reads: {[h for h in headers if h]}. "
+                   "Fix row 1 to match sheet_headers.csv (one name per cell, spelled exactly) "
+                   "and run the sync again. No rows were touched this run.")
+        logger.error(message)
+        notify.send_alert_email("Sheet header row needs fixing", message)
+        sys.exit(1)
+
+    # Bracketed consistent read (2026-08-31): the 08-29 guard compared two
+    # column reads taken AFTER the records read, so an edit landing between
+    # the records read and the first column read passed both checks with a
+    # skewed SKU-to-details join - the hole behind the 08-29 wrong-content
+    # creates (34 listings shipped with neighbouring rows' details). The
+    # SKU column is now read BEFORE and AFTER the records read; identical
+    # brackets prove the records read happened in a quiet window. SKUs come
+    # from the column's DISPLAYED text: numericise strips leading zeros
+    # (the 127 census-pair products, repaired 2026-08-25).
+    for _stab in range(3):
+        sku_display = with_retry(lambda: sheet.col_values(col_map["SKU"]),
+                                 what="sku display column", max_attempts=3)
+        data = with_retry(lambda: sheet.get_all_records(),
+                          what="sheet read", max_attempts=3)
+        # Same hygiene on the row dicts (their keys come from the header row).
+        data = [{str(k).strip(): v for k, v in row.items()} for row in data]
+        _sku_display_2 = with_retry(lambda: sheet.col_values(col_map["SKU"]),
+                                    what="sku display column recheck", max_attempts=3)
+        if _sku_display_2 == sku_display:
+            break
+        logger.warning("Sheet changed during the read - re-reading for a consistent snapshot (attempt %d)", _stab + 1)
+    else:
+        logger.error("Sheet still being edited after 3 re-reads - aborting this run untouched; the next run will retry")
+        sys.exit(1)
+
+    def _remap_row_writes(updates, what):
+        """Re-anchors row-addressed cell writes ("AB123") right before a
+        flush. Sheet writes are accumulated against row numbers captured at
+        read time; a team row insert/delete during the run shifts the live
+        rows, so flushing as-is lands each write a few rows off - that is
+        how neighbouring products' details ended up under each other's SKUs
+        on 2026-08-29/31 (34 wrong listings). Each write's row is identified
+        by the SKU that occupied it in the read-time column snapshot and
+        follows that SKU to its current row; a write whose anchor SKU
+        vanished or is duplicated is dropped (redone next run). Returns
+        (updates, rows_shifted_flag)."""
+        fresh = with_retry(lambda: sheet.col_values(col_map["SKU"]),
+                           what="sku column at write time", max_attempts=3)
+        if fresh == sku_display:
+            return updates, False
+        pos = {}
+        for _idx, _val in enumerate(fresh):
+            _key = str(_val).replace(",", "").strip()
+            if _idx and _key:
+                pos.setdefault(_key, []).append(_idx + 1)
+        kept, n_remap, n_drop = [], 0, 0
+        for _u in updates:
+            _rng = str(_u["range"])
+            _head = _rng.rstrip("0123456789")
+            try:
+                _row_n = int(_rng[len(_head):])
+            except ValueError:
+                kept.append(_u)
+                continue
+            _sku = str(sku_display[_row_n - 1]).replace(",", "").strip() if _row_n - 1 < len(sku_display) else ""
+            _tgt = pos.get(_sku) or []
+            if _sku and len(_tgt) == 1:
+                if _tgt[0] != _row_n:
+                    _u = {"range": f"{_head}{_tgt[0]}", "values": _u["values"]}
+                    n_remap += 1
+                kept.append(_u)
+            else:
+                n_drop += 1
+        logger.warning("%s: sheet rows moved during the run - %d write(s) re-anchored to their SKU's current row, %d dropped (redone next run)", what, n_remap, n_drop)
+        return kept, True
+    for _i, _row in enumerate(data):
+        if _i + 1 < len(sku_display):
+            _row["SKU"] = str(sku_display[_i + 1]).replace(",", "").strip()
+
+    # Manual targeted runs: the dispatch form's `rows` input (env ROWS_RANGE,
+    # e.g. "2200-2320", "116", "10-50,200-210") limits THIS run - batch
+    # selection, OOS pass and activation pass - to those sheet row numbers
+    # (as seen in Google Sheets, header = row 1). Scheduled runs never set
+    # it. A typed range also overrides the manual-run "unfilled rows only"
+    # default: naming rows means refresh exactly these, filled or not.
+    rows_range_spec = (os.getenv("ROWS_RANGE") or "").strip()
+    rows_ranges = []
+    if rows_range_spec:
+        for _part in rows_range_spec.split(","):
+            _part = _part.strip()
+            if not _part:
+                continue
+            _a, _, _b = _part.partition("-")
+            try:
+                _lo, _hi = int(_a), int(_b or _a)
+            except ValueError:
+                logger.error("rows input %r is not a row number or a start-end range", _part)
+                sys.exit(1)
+            rows_ranges.append((min(_lo, _hi), max(_lo, _hi)))
+        logger.info("Targeted run: limited to sheet row(s) %s", rows_range_spec)
+
+    def row_in_ranges(rownum):
+        return (not rows_ranges) or any(lo <= rownum <= hi for lo, hi in rows_ranges)
+
+    logger.info("TOTAL ROWS IN SHEET: %d", len(data))
+
+    # ================= DYNAMIC BATCH SIZE =================
+    # Sized from the actual row count and the eBay daily call budget, so the
+    # same code scales from a 150-row catalog to a 5,000-row one without
+    # needing a manual reconfiguration each time it grows - see the comment
+    # on EBAY_DAILY_CALL_BUDGET/RUNS_PER_DAY above.
+    if _MAX_PRODUCTS_PER_RUN_OVERRIDE:
+        MAX_PRODUCTS_PER_RUN = max(1, int(_MAX_PRODUCTS_PER_RUN_OVERRIDE))
+    else:
+        # ADAPTIVE (2026-09-23): GitHub delivers only ~5 of the 12
+        # scheduled runs on busy days (observed 4.5-5h gaps), so a
+        # budget/RUNS_PER_DAY batch spent under half the eBay budget
+        # and stretched every re-check cycle. The batch now covers the
+        # REAL elapsed time since the previous run - measured from the
+        # newest Last Checked Time on the sheet, no extra state - so
+        # the day's spend tracks the budget whatever the cadence.
+        MAX_PRODUCTS_PER_RUN = max(1, EBAY_DAILY_CALL_BUDGET // RUNS_PER_DAY)
+        try:
+            # The 100th-newest stamp, not the newest (rotation.reference_time): a
+            # small manual/targeted run must not reset the clock, or the next
+            # scheduled batch shrinks to the few minutes since it.
+            _newest = rotation.reference_time(parse_time(r.get("Last Checked Time", "")) for r in data)
+            if _newest is not None:
+                # Last Checked Time cells are naive PK wall clock - compare naive to naive
+                _now_pk = datetime.now(PK_TZ).replace(tzinfo=None)
+                _elapsed_h = (_now_pk - _newest).total_seconds() / 3600.0
+                if _elapsed_h > 0:
+                    # A gap over 24h counts as 24h (an outage must not shrink
+                    # the next batch back to the fixed size), and one run may
+                    # carry up to HALF the day's budget. The old cap was a
+                    # quarter (1,200 at YRA = six hours' worth), so every gap
+                    # beyond 6h - routine with GitHub's cron drops - threw
+                    # budget away: ~3,900 of 4,800 calls used per day.
+                    _elapsed_h = min(_elapsed_h, 24.0)
+                    _adaptive = int(EBAY_DAILY_CALL_BUDGET * _elapsed_h / 24.0)
+                    MAX_PRODUCTS_PER_RUN = min(max(MAX_PRODUCTS_PER_RUN, _adaptive),
+                                               EBAY_DAILY_CALL_BUDGET // 2)
+        except Exception as exc:  # noqa: BLE001 - sizing must never kill a run
+            logger.warning("adaptive batch sizing failed (%s) - using the fixed size", exc)
+
+    cycle_runs = -(-len(data) // MAX_PRODUCTS_PER_RUN) if data else 0  # ceil division
+    cycle_days = cycle_runs / RUNS_PER_DAY if RUNS_PER_DAY else 0
+    logger.info(
+        "Batch size: %d products/run (budget %d eBay calls/day over %d runs/day) "
+        "- a full refresh cycle over %d rows takes ~%.1f day(s)",
+        MAX_PRODUCTS_PER_RUN, EBAY_DAILY_CALL_BUDGET, RUNS_PER_DAY, len(data), cycle_days,
+    )
+
+    # ================= CATEGORY FILE =================
+    onbuy_categories = []
+    category_id_by_path = {}
+    denied_category_ids = load_category_denylist()
+
+    with open("onbuy_categories_only.csv", newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            category = row.get("OnBuy Category Path")
+            if str(row.get("Category ID") or "").strip() in denied_category_ids:
+                continue   # OnBuy refuses it as "not a lowest level category" whatever its can_list_in flag says
+            if category:
+                onbuy_categories.append(category)
+                try:
+                    category_id_by_path[category.strip().lower()] = int(row.get("Category ID"))
+                except (TypeError, ValueError):
+                    category_id_by_path[category.strip().lower()] = None
+
+    logger.info("Loaded %d OnBuy categories", len(onbuy_categories))
+
+    # Amazon rows: Amazon's own product-type code (Keepa "type": MONITOR,
+    # TELEVISION ...) names the product outright, so a hand-kept map from it
+    # to an OnBuy shelf decides before any word matching (GTV lesson
+    # 2026-09-09: a monitor landed in Mounts & Stands off its description).
+    # Only listable paths count; extend amazon_type_categories.csv as new
+    # types appear.
+    amazon_type_map = {}
+    try:
+        with open("amazon_type_categories.csv", newline="", encoding="utf-8") as fh:
+            for _r in csv.DictReader(fh):
+                _t = (_r.get("Amazon Type") or "").strip().upper()
+                _p = (_r.get("OnBuy Category Path") or "").strip()
+                if _t and _p:
+                    amazon_type_map[_t] = _p
+    except FileNotFoundError:
+        pass
+
+    def amazon_type_category(amazon_type):
+        path = amazon_type_map.get(str(amazon_type or "").strip().upper())
+        if path and is_valid_onbuy_category(path):
+            logger.info("Category from Amazon type map %r -> %s", amazon_type, path)
+            return path
+        return ""
+
+    valid_onbuy_categories = set(cat.strip().lower() for cat in onbuy_categories)
+
+    def is_valid_onbuy_category(category):
+        return str(category).strip().lower() in valid_onbuy_categories
+
+    # A NON-EMPTY Category cell is a human decision (2026-08-22: 44 Arden rows
+    # the user had categorised by hand were re-matched after OnBuy renamed
+    # 107 paths and our category file was refreshed). Never replace typed
+    # text with a guess: resolve it - exact path; the row's Category ID
+    # (renames keep the id); a unique leaf name - or keep it and flag it.
+    _display_path = {cat.strip().lower(): cat for cat in onbuy_categories}
+    _path_by_id = {}
+    for _p, _id in category_id_by_path.items():
+        if _id is not None and _id not in _path_by_id:
+            _path_by_id[_id] = _p
+    _leaf_index = {}
+    for _cat in onbuy_categories:
+        _leaf_index.setdefault(_cat.rsplit(" > ", 1)[-1].strip().lower(), []).append(_cat)
+
+    def resolve_manual_category(current_category, current_id=None):
+        """(path, resolved). resolved=False keeps the typed text untouched."""
+        text = str(current_category or "").strip()
+        if not text:
+            return "", False
+        if is_valid_onbuy_category(text):
+            return _display_path[text.lower()], True
+        try:
+            cid = int(float(str(current_id).strip())) if str(current_id or "").strip() else None
+        except (TypeError, ValueError):
+            cid = None
+        if cid is not None and cid in _path_by_id:
+            return _display_path[_path_by_id[cid]], True
+        leaf = text.rsplit(" > ", 1)[-1].strip().lower()
+        if len(_leaf_index.get(leaf, [])) == 1:
+            return _leaf_index[leaf][0], True
+        return text, False
+
+    # Precomputed token sets per category path (and per leaf segment) - both
+    # for speed and correctness. The old scorer gave +2 whenever a product
+    # word appeared as a SUBSTRING anywhere in the path text, so a
+    # DisplayPort adapter (description mentioning "home", "supports" - and
+    # "port" is literally a substring of "Supports") landed in "Braces,
+    # Splints & Slings > Arm, Hand & Finger Supports" (found on the Arden
+    # store; same matcher here). This version matches whole words only,
+    # weights title words over description words (titles identify the
+    # product; descriptions are marketing text), weights the leaf segment
+    # over ancestors, and refuses to guess without at least one strong
+    # title-level match. Rows already holding a valid category path are
+    # never touched, so existing catalog categories are unaffected.
+    category_tokens = {}
+    category_leaf_tokens = {}
+    category_leaf_phrase = {}  # path -> ordered stemmed words of the leaf name
+    category_guard = {}  # path -> required word set (None = unguarded)
+    for _path in onbuy_categories:
+        category_tokens[_path] = category_match_tokens(_path)
+        category_leaf_tokens[_path] = category_match_tokens(_path.split(">")[-1])
+        category_leaf_phrase[_path] = tuple(
+            _stem(w) for w in re.findall(r"\w+", _path.split(">")[-1].lower()))
+        _low = _path.strip().lower()
+        category_guard[_path] = next(
+            (req for prefix, req in _GUARDED_SUBTREES if _low.startswith(prefix)), None)
+
+    def type_category(product_type, title="", description=""):
+        """The category eBay's Type field alone justifies, or None.
+        Extracted so maintenance runs can ask it directly."""
+        # eBay's structured Type is AUTHORITATIVE and runs FIRST (user
+        # 2026-08-03: a smart watch landed in Car GPS Trackers because its
+        # title carries "GPS" and "tracker" as feature words - scoring a
+        # marketing title can never beat a field that names the product).
+        # Still strict: leaf names only, unique best required; anything
+        # ambiguous falls through to the title scorer exactly as before.
+        # Leaf-name-only matching, subset in either direction (tokens are
+        # plural-normalized), and only a UNIQUE best is accepted: precision
+        # over recall, the DisplayPort rule. Ties or no candidates fall
+        # through to the human worklist exactly as before.
+        type_tokens = category_match_tokens(product_type)
+        if type_tokens:
+            # Words a leaf adds beyond the Type must be corroborated by the
+            # product's own words: a Type of "GPS Tracker" must not become
+            # "Car GPS Trackers" unless the listing actually says "car"
+            # (2026-08-03). "Phone Case" -> "Mobile Phone Cases" still
+            # works because such listings do say "mobile".
+            corroborating = category_match_tokens(f"{title}\n{description}")
+            candidates = []
+            for category_path in onbuy_categories:
+                leaf = category_leaf_tokens[category_path]
+                if not leaf:
+                    continue
+                # A 1-word Type may only take a leaf whose visible name it
+                # covers completely - "Light" must NOT take "DJ Lights"
+                # (the 2-letter DJ vanishes in tokenization). Multi-word
+                # Types may also sub-match inside a bigger leaf.
+                leaf_word_count = len(tokenize(category_path.split(">")[-1]))
+                covers_whole_leaf = leaf <= type_tokens and leaf_word_count == len(leaf)
+                strong_submatch = len(type_tokens) >= 2 and (leaf <= type_tokens or type_tokens <= leaf)
+                if covers_whole_leaf or strong_submatch:
+                    extras = leaf - type_tokens
+                    if extras and not extras <= corroborating:
+                        continue
+                    overlap = len(leaf & type_tokens)
+                    if overlap:
+                        candidates.append((overlap, -len(leaf - type_tokens),
+                                           -len(category_path), category_path))
+            if candidates:
+                candidates.sort(reverse=True)
+                if len(candidates) == 1 or candidates[0][:2] > candidates[1][:2]:
+                    logger.info("Category matched via eBay Type %r -> %s",
+                                product_type, candidates[0][3])
+                    return candidates[0][3]
+        return None
+
+    def map_onbuy_category(title, current_category, description="", product_type=""):
+        by_type = type_category(product_type, title, description)
+        if by_type:
+            return by_type
+        by_phrase = title_phrase_category(title)
+        if by_phrase:
+            logger.info("Category matched via curated title phrase -> %s", by_phrase)
+            return by_phrase
+        title_words = category_match_tokens(f"{title}\n{current_category}")
+        desc_words = category_match_tokens(description) - title_words
+        all_words = title_words | desc_words
+        if not all_words:
+            return current_category
+
+        def weight(word):
+            # Longer words are more specific; title words count triple.
+            return len(word) * (3 if word in title_words else 1)
+
+        best_match = None
+        best_score = 0
+        best_has_title_hit = False
+        for category_path in onbuy_categories:
+            required = category_guard[category_path]
+            if required and not (all_words & required):
+                continue
+            hits = all_words & category_tokens[category_path]
+            if not hits:
+                continue
+            leaf_hits = hits & category_leaf_tokens[category_path]
+            score = sum(weight(w) for w in hits) + 2 * sum(weight(w) for w in leaf_hits)
+            if score > best_score:
+                best_score = score
+                best_match = category_path
+                best_has_title_hit = bool(hits & title_words)
+
+        # Refuse to guess unless at least one TITLE word matched (titles
+        # identify the product; a description-only match is marketing noise).
+        # An unmatched row keeps its current/blank category - the push block
+        # below turns that into a clear "fill in the Category column" status
+        # instead of submitting a wrong or null category to OnBuy.
+        if best_match and best_score >= 9 and best_has_title_hit:
+            return best_match
+
+        # ---- Leaf-named-in-title fallback (2026-08-05, ported from the
+        # GTV store with its phrase-containment tightening) ----
+        # Only reached when the scorer above REFUSED, so behaviour changes
+        # solely for rows that were failing anyway. Diagnosed there:
+        # listings with no eBay Type whose descriptions drowned the scorer
+        # in generic boilerplate - "Model Train Replacement Parts" (hits:
+        # part, replacement, model, accessory) outscored every real audio
+        # leaf for a pair of earbuds, and that junk winner had no title
+        # hit, so the refusal fired even though the title said "Tablet"/
+        # "Speaker" outright.
+        #
+        # The leaf's visible name must appear as a CONTIGUOUS PHRASE in the
+        # title (stemmed, in order), not merely as scattered word tokens.
+        # The first token-subset version matched an "Opsite Post-Op
+        # Dressing ... Box of 20" (a medical wound dressing) to Garden
+        # Decor > Post Boxes on its first live firing - "post" from
+        # Post-Op plus "box" from Box of 20, words in unrelated roles. A
+        # phrase can't be assembled from scattered words, so that class of
+        # error is structurally impossible here. Longest phrase wins
+        # ("Tablet Cases" beats "Tablets" for a case listing); a tie at the
+        # top refuses; guarded subtrees keep their guard.
+        title_seq = [_stem(w) for w in re.findall(r"\w+", str(title).lower())]
+        covered = []
+        for category_path in onbuy_categories:
+            required = category_guard[category_path]
+            if required and not (all_words & required):
+                continue
+            phrase = category_leaf_phrase[category_path]
+            n = len(phrase)
+            if not n or n > len(title_seq):
+                continue
+            if any(tuple(title_seq[i:i + n]) == phrase
+                   for i in range(len(title_seq) - n + 1)):
+                covered.append((n, -len(category_path), category_path))
+        if covered:
+            covered.sort(reverse=True)
+            if len(covered) == 1 or covered[0][0] > covered[1][0]:
+                logger.info("Category matched via leaf-in-title -> %s", covered[0][2])
+                return covered[0][2]
+
+        return current_category
+
+    # ================= ONBUY CLIENT =================
+    onbuy = OnBuyClient()
+    onbuy_ready = False
+    if ONBUY_API_PUSH_ENABLED:
+        onbuy_ready = onbuy.authenticate()
+        if not onbuy_ready:
+            run_had_errors = True
+            logger.error("ONBUY_API_PUSH_ENABLED is true but OnBuy authentication failed - skipping all OnBuy API pushes this run")
+
+    # ================= CATEGORY MAPPING =================
+    # Cheap full-catalog pass (no eBay calls) for rows that already have a
+    # Title/Description from a previous run. A brand-new row (employee only
+    # pasted the URL) still has blank Title/Description at this point, so it
+    # can't be mapped yet here - the main loop below re-checks category using
+    # the freshly-fetched eBay data for exactly that case.
+    if RUN_CATEGORY_MAPPING:
+        logger.info("Updating categories...")
+        category_updates = []
+        for idx, row in enumerate(data):
+            i = idx + 2
+            current_category = str(row.get("Category") or "").strip()
+            if is_valid_onbuy_category(current_category):
+                continue
+            if current_category:
+                resolved, ok = resolve_manual_category(current_category, row.get("Category ID"))
+                if ok and resolved != current_category:
+                    category_updates.append({"range": f"{col_letter(col_map['Category'])}{i}", "values": [[resolved]]})
+                    logger.info("Row %d: category text refreshed to OnBuy's current name: %r -> %r", i, current_category, resolved)
+                elif not ok:
+                    logger.info("Row %d: manual category %r not recognised - kept as typed, not remapped", i, current_category)
+                continue
+            mapped = map_onbuy_category(row.get("Title"), current_category, row.get("Description"))
+            if mapped != current_category:
+                category_updates.append({"range": f"{col_letter(col_map['Category'])}{i}", "values": [[mapped]]})
+                logger.info("Mapped row %d", i)
+        if category_updates:
+            category_updates, _ = _remap_row_writes(category_updates, "category writes")
+        if category_updates:
+            sheet.batch_update(category_updates)
+
+    updated_count = 0
+    onbuy_created = 0
+    onbuy_updated = 0
+    onbuy_failed = 0
+    onbuy_removed = 0
+    onbuy_brand_blocked = 0  # brand owned by another seller - flagged, kept (2026-08-03)
+    onbuy_deferred = 0  # created earlier, listing not yet updatable on OnBuy's side
+    onbuy_suspended_locked = 0  # listing suspended on OnBuy - edits rejected until reactivation
+    onbuy_no_price = 0  # already-created rows with no usable price - push skipped (never send price 0)
+    onbuy_protected = 0  # protected_skus.txt rows - push skipped until content repair lands (2026-08-21)
+    onbuy_create_paused = 0  # creates held back by ONBUY_CREATE_ENABLED=false (2026-08-21)
+    onbuy_postponed = 0  # transient OnBuy/transport trouble - status left untouched, retried next run
+    onbuy_skipped_dead = 0  # eBay listing gone + never created on OnBuy - nothing to create (2026-08-06)
+    onbuy_needs_category = 0  # refusals awaiting a Category cell - a worklist, not failures (2026-08-06)
+    onbuy_halt_reason = None  # set when pushing must stop for the rest of the run (rate limit / dead token)
+    onbuy_pushes_this_run = 0
+    oos_missed_push = []  # (sku, price): stock-0 rows that missed a push slot this run
+    rows_to_delete = []  # Sheet row numbers to remove entirely - see the
+    # "supplied brand is owned by another seller" check below. Applied after
+    # every other Sheet write this run, in descending row order, so deleting
+    # one doesn't shift the row numbers the other writes/highlights already
+    # targeted.
+
+    # ================= OUT-OF-STOCK PASS (2026-08-15) =================
+    # A row that goes out of stock gets its sheet refresh immediately, but
+    # its OnBuy push competed for the same capped slots as everything else,
+    # and a capped-out row only retried on its NEXT rotation visit (~1.5
+    # days on a large catalog) - so OnBuy kept selling sold-out products
+    # (user-reported oversell risk, 4 known SKUs on this store's sibling).
+    # Out of stock is the one state that must never wait: before ANY other
+    # push, zero the OnBuy stock of every row whose sheet says 0 but whose
+    # last push predates its last data refresh. Runs first = highest
+    # priority; steady-state it is a trickle (only newly-OOS rows).
+    if ONBUY_API_PUSH_ENABLED and onbuy_ready:
+        oos_pending = []
+        for idx, row in enumerate(data):
+            if not row_in_ranges(idx + 2):
+                continue
+            status = str(row.get("Sync Status") or "").strip()
+            # "Awaiting OnBuy go-live" rows ARE created products - excluding
+            # them left sold-out listings live on the front end while the
+            # listing stayed unaddressable (SKU 198651491114, 2026-08-24).
+            # Zero them too; not-yet-addressable ones bounce and retry.
+            # A FROZEN row (Failed:/BRAND BLOCKED - duplicate supplier link, SKU
+            # conflict...) never reaches the normal push, so a LIVE one could not
+            # be taken offline when its supplier sold out: 350 live duplicates sat
+            # untouchable at YRA (2026-10-01, wrong order). Zeroing is the one
+            # push that is always safe, so frozen-but-live rows are included.
+            _frozen_live = (status.startswith(("Failed", "BRAND BLOCKED"))
+                            and str(row.get("OnBuy Product Created") or "").strip().upper() == "TRUE")
+            if not (status.startswith("Synced") or status.startswith("Pending Approval")
+                    or status.startswith("Awaiting OnBuy go-live") or _frozen_live):
+                continue
+            raw_stock = str(row.get("Stock") if row.get("Stock") is not None else "").strip()
+            if raw_stock == "":
+                continue
+            try:
+                if int(float(raw_stock)) != 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if parse_time(row.get("Last OnBuy Sync", "")) >= parse_time(row.get("Last Checked Time", "")):
+                continue  # the last push already carried this state
+            sku = str(row.get("SKU") or "").strip()
+            if not sku:
+                continue
+            try:
+                price = float(row.get("Selling Price (£)") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            oos_pending.append((idx, sku, price if price > 0 else None))
+        if oos_pending:
+            logger.info("OOS pass: %d out-of-stock row(s) with a stale OnBuy push", len(oos_pending))
+        if any(p is None for _, _, p in oos_pending):
+            # A row with no usable sheet price must not push a placeholder -
+            # 0.01 invites the "Price below minimum" auto-suspension, which
+            # would lock the listing against its restock update later. Use
+            # the listing's own current price; skip if neither side has one.
+            from onbuy_client import BASE_URL as _oos_base
+            _lp = {}
+            _off = 0
+            while True:
+                def _oos_page(off=_off):
+                    r = onbuy._send("GET", f"{_oos_base}/listings", what="OOS listings page",
+                                    params={"site_id": onbuy.site_id, "limit": 100, "offset": off},
+                                    timeout=60)
+                    r.raise_for_status()
+                    return r
+                try:
+                    _body = with_retry(_oos_page, what=f"OOS listings page {_off}", max_attempts=3).json()
+                except Exception as exc:
+                    logger.warning("OOS listing-price sweep failed (%s) - price-less rows skip this run", exc)
+                    break
+                _items = _body.get("results") if isinstance(_body, dict) else _body
+                if not isinstance(_items, list) or not _items:
+                    break
+                for _it in _items:
+                    _it = _it or {}
+                    # Listings held under a corrupted SKU answer under it;
+                    # key the price map by the SKU the sheet uses.
+                    _s = sku_aliases.to_true(_it.get("sku"))
+                    if _s:
+                        try:
+                            _lp[_s] = float(_it.get("price") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                if len(_items) < 100 and not onbuy.more_listings(_off, 100):
+                    break
+                _off += 100
+            oos_pending = [(i2, s2, (p2 if p2 else _lp.get(s2))) for i2, s2, p2 in oos_pending]
+            _skipped = sum(1 for _, _, p in oos_pending if not p)
+            if _skipped:
+                logger.info("OOS pass: %d row(s) skipped - no usable price on row or listing", _skipped)
+            oos_pending = [t for t in oos_pending if t[2]]
+        oos_done = oos_bounced = 0
+        now_oos = datetime.now(PK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        oos_updates = []
+        # Batched like the activation pass (one call per 500 SKUs). Per-item
+        # errors (hidden/suspended listings rejecting the update) stamp the
+        # row so it does not monopolise this pass; it re-enters if a later
+        # refresh changes its state again.
+        for c0 in range(0, len(oos_pending), 500):
+            if onbuy_halt_reason is not None:
+                break
+            chunk = oos_pending[c0:c0 + 500]
+            onbuy_pushes_this_run += 1
+            try:
+                results = onbuy.update_listings_by_sku_batch(
+                    [(sku, price, 0) for _idx, sku, price in chunk])
+            except (TransientError, AuthError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                logger.warning("OOS batch postponed: %s", exc)
+                if isinstance(exc, AuthError):
+                    run_had_errors = True
+                if isinstance(exc, (RateLimitError, AuthError)):
+                    onbuy_halt_reason = str(exc)[:200]
+                continue
+            except Exception as exc:
+                logger.warning("OOS batch failed outright: %s", str(exc)[:200])
+                continue
+            outcome = {}
+            for it in results:
+                it = it or {}
+                s = str(it.get("sku") or "").strip()
+                if s:
+                    outcome[s] = str(it.get("error") or "").strip()
+            for idx, sku, _price in chunk:
+                i = idx + 2
+                err = outcome.get(sku, "")
+                if sku in outcome and not err:
+                    oos_done += 1
+                    if "Last OnBuy Sync" in col_map:
+                        oos_updates.append({"range": f"{col_letter(col_map['Last OnBuy Sync'])}{i}", "values": [[now_oos]]})
+                else:
+                    oos_bounced += 1
+                    if err:
+                        logger.info("OOS push bounced for SKU %s (%s) - stamped", sku, err[:120])
+                    if "Last OnBuy Sync" in col_map:
+                        oos_updates.append({"range": f"{col_letter(col_map['Last OnBuy Sync'])}{i}", "values": [[now_oos]]})
+            time.sleep(1.0)
+        if oos_updates:
+            oos_updates, _ = _remap_row_writes(oos_updates, "OOS writes")
+        if oos_updates:
+            try:
+                with_retry(lambda: sheet.batch_update(
+                    [dict(u) for u in oos_updates]), what="OOS sheet update", max_attempts=3)
+            except Exception as exc:
+                logger.error("OOS sheet update failed: %s", exc)
+        if oos_done or oos_bounced:
+            logger.info("OOS pass: %d zeroed on OnBuy, %d bounced", oos_done, oos_bounced)
+
+    # ================= OVERSELL GUARD (2026-10-02) =================
+    # The OOS pass above only re-zeroes rows whose last push predates their last
+    # check: a push that bounced was stamped as done, and stock raised on OnBuy
+    # afterwards stayed sellable until the nightly audit (wrong order, SKU
+    # 175117835194). This pass re-sends stock 0 for EVERY live row the sheet says
+    # is out of stock - one batched PUT, no GET, no extra auth (oversell_guard.py);
+    # it never raises and counts against the push budget like any other batch.
+    if ONBUY_API_PUSH_ENABLED and onbuy_ready and onbuy_halt_reason is None and not rows_ranges:
+        onbuy_pushes_this_run += oversell_guard.run(spreadsheet, onbuy).get("requests", 0)
+
+    # ================= ACTIVATION PASS (2026-08-11) =================
+    # OnBuy support confirmed: product-create ignores embedded price/stock
+    # BY DESIGN - every new listing is born 0/0 and inactive, and only a
+    # by-SKU stock/price update activates it. Waiting for the row's next
+    # batch visit works on a small catalog (GTV/YRA activated thousands
+    # that way) but loses the race against the zero-price auto-suspension
+    # on a large one (OpenMaal's 6,000-row load: 3-6 day revisit vs 2-4
+    # day suspension - and suspended listings reject all edits). So every
+    # run FIRST activates created-but-never-synced rows directly from the
+    # price/stock already on the row: no eBay calls, shares the OnBuy push
+    # cap, freshest rows first. A row whose update bounces ("SKU does not
+    # exist" - not addressable yet, or already suspended) gets its Last
+    # OnBuy Sync stamped so it falls back to normal rotation instead of
+    # monopolising this pass every run.
+    if ONBUY_API_PUSH_ENABLED and onbuy_ready:
+        pending_activation = []
+        for idx, row in enumerate(data):
+            if not row_in_ranges(idx + 2):
+                continue
+            status = str(row.get("Sync Status") or "").strip()
+            # "Pending Approval" = fresh create; "Synced" with a blank Last
+            # OnBuy Sync = the hourly backfill confirmed the queue before this
+            # pass got to the row - either way we have never pushed its
+            # price/stock, so it is still sitting 0/0 inactive on OnBuy.
+            if not (status.startswith("Pending Approval") or status.startswith("Synced")):
+                continue
+            if str(row.get("Last OnBuy Sync") or "").strip():
+                continue
+            sku = str(row.get("SKU") or "").strip()
+            if sku in PROTECTED_SKUS:
+                continue
+            try:
+                a_price = float(row.get("Selling Price (£)") or 0)
+                a_stock = int(float(row.get("Stock") or 0))
+            except (TypeError, ValueError):
+                continue
+            if not sku or a_price <= 0 or a_stock <= 0:
+                continue
+            pending_activation.append((idx, sku, a_price, a_stock,
+                                       str(row.get("Last Checked Time") or ""), row_delivery_template(row)))
+        # Freshest creations first - they are the ones still inside the
+        # editable window.
+        pending_activation.sort(key=lambda t: t[4], reverse=True)
+        if pending_activation:
+            logger.info("Activation pass: %d created-but-inactive row(s) pending", len(pending_activation))
+        activation_updates = []
+        activated = act_bounced = act_waiting = 0
+        now_act = datetime.now(PK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        # Batched per OnBuy support's own recommendation (2026-08-18): up to
+        # 1,000 SKUs per PUT /v2/listings/by-sku request, answered 200 with
+        # per-item errors inline. One chunk costs ONE call against the hourly
+        # quota, so the whole pool fits in every run and the old half-budget
+        # slot cap is obsolete. "SKU does not exist" items stay pending (no
+        # stamp) - the queue hasn't made them addressable; genuinely rejected
+        # rows drop out when the hourly backfill rewrites their status.
+        for c0 in range(0, len(pending_activation), 500):
+            if onbuy_halt_reason is not None:
+                break
+            chunk = pending_activation[c0:c0 + 500]
+            onbuy_pushes_this_run += 1
+            try:
+                results = onbuy.update_listings_by_sku_batch(
+                    [(sku, a_price, a_stock, tmpl) for _idx, sku, a_price, a_stock, _t, tmpl in chunk])
+            except (TransientError, AuthError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                logger.warning("Activation batch postponed: %s", exc)
+                if isinstance(exc, AuthError):
+                    run_had_errors = True
+                if isinstance(exc, (RateLimitError, AuthError)):
+                    onbuy_halt_reason = str(exc)[:200]
+                continue
+            except Exception as exc:
+                logger.warning("Activation batch failed outright: %s", str(exc)[:200])
+                continue
+            outcome = {}
+            for it in results:
+                it = it or {}
+                s = str(it.get("sku") or "").strip()
+                if s:
+                    outcome[s] = str(it.get("error") or "").strip()
+            for idx, sku, _p, _s2, _t, _tmpl in chunk:
+                i = idx + 2
+                if sku not in outcome:
+                    act_waiting += 1
+                    continue
+                err = outcome[sku]
+                if not err:
+                    activated += 1
+                    if "Sync Status" in col_map:
+                        activation_updates.append({"range": f"{col_letter(col_map['Sync Status'])}{i}", "values": [["Synced"]]})
+                    if "Last OnBuy Sync" in col_map:
+                        activation_updates.append({"range": f"{col_letter(col_map['Last OnBuy Sync'])}{i}", "values": [[now_act]]})
+                    if "OnBuy Listing Active" in col_map:
+                        activation_updates.append({"range": f"{col_letter(col_map['OnBuy Listing Active'])}{i}", "values": [["TRUE"]]})
+                elif "sku does not exist" in err.lower():
+                    act_waiting += 1
+                else:
+                    act_bounced += 1
+                    logger.info("Activation bounced for SKU %s (%s) - stamped back to rotation", sku, err[:120])
+                    if "Last OnBuy Sync" in col_map:
+                        activation_updates.append({"range": f"{col_letter(col_map['Last OnBuy Sync'])}{i}", "values": [[now_act]]})
+            time.sleep(1.0)
+        if activation_updates:
+            activation_updates, _ = _remap_row_writes(activation_updates, "activation writes")
+        if activation_updates:
+            try:
+                with_retry(lambda: sheet.batch_update(
+                    [dict(u) for u in activation_updates]), what="activation sheet update", max_attempts=3)
+            except Exception as exc:
+                logger.error("Activation sheet update failed: %s", exc)
+        if activated or act_bounced or act_waiting:
+            logger.info("Activation pass: %d activated, %d awaiting addressability, %d bounced to rotation", activated, act_waiting, act_bounced)
+
+    # ================= PRODUCT ORDER =================
+    # Rows with no usable Supplier URL yet (e.g. a SKU pre-filled ahead of the
+    # rest of the row) can never actually be processed - the main loop below
+    # just silently `continue`s past them without ever setting Last Checked
+    # Time. Left in the sort, they never age out of "oldest first," so once
+    # there are more of them than MAX_PRODUCTS_PER_RUN they permanently
+    # occupy every run's entire batch and starve real, fully-filled-in rows
+    # of any processing at all (confirmed: 770 SKU-only rows blocked all 500
+    # slots in a run, so none of the 376 real rows were even reached).
+    # Filtering them out before the sort/slice means batch capacity is only
+    # ever spent on rows that can actually make progress.
+    processable = [(idx, row) for idx, row in enumerate(data)
+                   if supplier_of(row.get("Supplier URL", ""))
+                   and row_in_ranges(idx + 2)]
+    if rows_ranges:
+        logger.info("Targeted run: %d processable row(s) inside the requested range(s)", len(processable))
+    skipped_incomplete = len(data) - len(processable)
+    if skipped_incomplete:
+        logger.info("Skipping %d row(s) with no eBay/Amazon Supplier URL yet (not counted against this run's batch)", skipped_incomplete)
+
+    # A row with a Supplier URL but no SKU is only skipped by the main loop AFTER
+    # its supplier fetch and never gets a Last Checked Time, so it kept the oldest
+    # slot of every batch and cost one eBay call per run (Arden 2026-10-01: 182 such
+    # rows = 23% of every batch; under the age-based rotation they would rank first
+    # for ever). The SKU is entered by hand - they wait outside the batch until it is.
+    processable, _no_sku = rotation.split_no_sku(processable)
+    if _no_sku:
+        logger.warning("%d row(s) have a Supplier URL but no SKU yet (sheet rows %s) - left out of the batch until a SKU is added",
+                       len(_no_sku), ", ".join(str(idx + 2) for idx, _r in _no_sku[:10]) + (", ..." if len(_no_sku) > 10 else ""))
+
+    # A supplier link that belongs on the OTHER tab must not stall this
+    # lane: run.yml (the eBay lane) carries no Keepa key, so an Amazon
+    # link pasted onto the eBay tab aborted the WHOLE eBay sync at the
+    # Keepa client (Makstore, 2026-09-16..18 - 8 runs lost, catalog
+    # unsynced for two days). Misplaced rows are filtered out pre-sort
+    # exactly like URL-less rows (they can make no progress in this
+    # lane) and called out loudly for a human to move them to the
+    # Amazon tab. The Amazon lane keeps its deliberate loud abort when
+    # the key is missing - that alarm is for rows on the RIGHT tab.
+    if not SHEET_TAB:
+        _misplaced = [(idx, row) for idx, row in processable
+                      if supplier_of(row.get("Supplier URL", "")) == "Amazon"]
+        if _misplaced:
+            processable = [(idx, row) for idx, row in processable
+                           if supplier_of(row.get("Supplier URL", "")) != "Amazon"]
+            _rows_txt = ", ".join(str(idx + 2) for idx, _ in _misplaced[:20]) + (
+                ", ..." if len(_misplaced) > 20 else "")
+            logger.warning("%d Amazon link(s) on the eBay tab (sheet row %s) - excluded "
+                           "from this run; move them to the Amazon tab", len(_misplaced), _rows_txt)
+            notify.send_alert_email(
+                "Amazon links on the eBay tab - rows skipped",
+                f"{len(_misplaced)} row(s) on the first (eBay) tab carry Amazon supplier "
+                f"links (sheet rows: {_rows_txt}). The eBay sync runs without a Keepa key, "
+                "so these rows cannot be processed in this lane - move each row to the "
+                "Amazon tab to have it fetched and listed.")
+
+    # Manual runs pick ONLY unfilled rows (no Title yet) by default - the
+    # Run button exists to onboard newly added products fast, not to
+    # re-fetch the whole catalogue (user policy 2026-07-22; a routine
+    # manual trigger was spending 28 minutes re-fetching 1,300 filled
+    # rows). Scheduled runs keep the full oldest-first rotation. Setting
+    # refresh_all=yes on the dispatch form restores a deliberate full
+    # sweep (repricing days). Local runs behave like scheduled.
+    if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" \
+            and not rows_ranges \
+            and str(os.getenv("REFRESH_ALL") or "").strip().lower() not in ("yes", "true", "1"):
+        _unfilled = [(idx, row) for idx, row in processable
+                     if not str(row.get("Title") or "").strip()]
+        logger.info("Manual run: limited to %d unfilled row(s) of %d processable - filled rows "
+                    "refresh on scheduled runs; set refresh_all=yes for a full sweep",
+                    len(_unfilled), len(processable))
+        processable = _unfilled
+
+    if FULL_REFRESH:
+        sorted_data = processable
+    else:
+        # Re-check order (2026-10-01): age x risk weight - see rotation.py.
+        # Few units left = checked more often, an out-of-stock row or a
+        # flagged row that is not live on OnBuy less often, and no row is
+        # ever starved (the 2026-09-22 lane left 3,922 default-stock rows
+        # 2-5 days stale; one of them oversold). Frozen rows that ARE live
+        # keep a normal weight: they are on sale.
+        sorted_data = rotation.rotation_order(
+            processable, datetime.now(PK_TZ).replace(tzinfo=None), parse_time)
+        _ri, _ro, _rh = rotation.describe(processable)
+        logger.info("Rotation: scored by age x risk - %d live in-stock row(s), %d out of stock, "
+                    "%d flagged and not live (low weight)", _ri, _ro, _rh)
+
+    # While testing the OnBuy API push against a specific SKU allowlist, move
+    # those SKUs to the front of the queue - otherwise a manual test run can
+    # easily land on a batch that doesn't include any of them (oldest-checked
+    # rows win by default), making it look like the push silently did nothing
+    # when really it just never got a chance to run.
+    if ONBUY_API_PUSH_ENABLED and ONBUY_API_TEST_SKUS:
+        sorted_data = sorted(
+            sorted_data,
+            key=lambda x: str(x[1].get("SKU") or "").strip() not in ONBUY_API_TEST_SKUS,
+        )
+
+    logger.info("Processing %d products", min(len(sorted_data), MAX_PRODUCTS_PER_RUN))
+
+    # ================= MAIN UPDATE LOOP =================
+    # An all-Amazon batch (the Amazon tab) never needs an eBay token; a
+    # missing token still aborts any batch that has eBay rows in it.
+    needs_ebay = any(supplier_of(row.get("Supplier URL")) == "eBay"
+                     for _, row in sorted_data[:MAX_PRODUCTS_PER_RUN])
+    token = get_ebay_token() if needs_ebay else None
+    if needs_ebay and not token:
+        # Abort instead of proceeding to call every row with a bad/missing
+        # token - the old code sent "Authorization: Bearer None" per row,
+        # which zeroed price/stock for the entire batch on a single auth failure.
+        logger.error("Could not obtain an eBay token - aborting run without touching any rows")
+        notify.send_alert_email(
+            "eBay authentication failed - run aborted",
+            "generate_xml.py could not obtain an eBay OAuth token this run. "
+            "No sheet rows were touched. Check EBAY_CLIENT_ID/EBAY_CLIENT_SECRET.",
+        )
+        sys.exit(1)
+
+    if needs_ebay and token:
+        # Size the batch to what eBay says is left today (2026-10-01): the
+        # adaptive batch can now carry up to half the daily budget, and a run
+        # that outruns the window gets a 429 on every remaining row.
+        _eb_left = ebay_calls_remaining(token)
+        if _eb_left is not None:
+            _eb_reserve = int(os.getenv("EBAY_CALL_RESERVE") or "150")
+            _eb_allowed = max(0, _eb_left - _eb_reserve)
+            logger.info("eBay allowance: %d call(s) left in today's window (reserve %d)", _eb_left, _eb_reserve)
+            if _eb_allowed < MAX_PRODUCTS_PER_RUN:
+                logger.warning("Batch cut from %d to %d row(s) to stay inside eBay's daily allowance",
+                               MAX_PRODUCTS_PER_RUN, _eb_allowed)
+                MAX_PRODUCTS_PER_RUN = _eb_allowed
+
+    _rl_streak = 0  # consecutive eBay rate-limit refusals - see the fetch loop
+    removed_skus = []  # matching SKUs, for the Supabase delete + summary log
+    supabase_rows = []  # one upsert for the whole run - every row must have
+    # identical keys (PostgREST's bulk-upsert requirement) AND every NOT NULL
+    # column must be present (Postgres validates that on the candidate insert
+    # row before it even checks ON CONFLICT, so a partial-column "tracking
+    # only" upsert can never work here - see fetch_existing_fields()).
+    highlight_requests = []
+    all_sheet_updates = []  # accumulated across every row, written in ONE batch_update
+    # after the loop instead of one call per row - a run can now process
+    # hundreds of rows (see dynamic batch sizing above), and one Sheets API
+    # write call per row at that scale risks Google's own rate limits, which
+    # weren't a concern back when this was capped at a hardcoded 12/run.
+    num_cols = len(headers)
+
+    batch = sorted_data[:MAX_PRODUCTS_PER_RUN]
+
+    # Within the selected batch, hand the limited OnBuy push slots
+    # (ONBUY_MAX_PUSHES_PER_RUN) to rows that have never been pushed first
+    # (blank "Last OnBuy Sync" parses to year 2000), then oldest-pushed.
+    # Without this, processing order == Last Checked Time order, which is
+    # stable across runs - so the same ~200 rows won the push slots every
+    # run and rows beyond the cap (including genuinely new, never-listed
+    # products) never reached OnBuy at all. Batch *selection* above stays
+    # based on Last Checked Time (eBay refresh fairness); this only reorders
+    # within the same set, so it changes who gets OnBuy slots, not which
+    # rows get their eBay/Sheet refresh. Skipped while a test-SKU allowlist
+    # is active so those keep absolute front-of-queue priority.
+    if not (ONBUY_API_PUSH_ENABLED and ONBUY_API_TEST_SKUS):
+        batch.sort(key=lambda x: parse_time(str(x[1].get("Last OnBuy Sync") or "")))
+
+    # Pre-fetch OPC + OnBuy-tracking fields already on record for this run's
+    # batch, so the single Supabase upsert (below) can carry forward real
+    # values instead of blanking them out for rows not pushed to OnBuy this
+    # run - see fetch_existing_fields() for why this has to be a single
+    # always-full-row upsert rather than a separate partial-column one.
+    skus_in_batch = [str(row.get("SKU") or "").strip() for _, row in batch]
+    skus_in_batch = [s for s in skus_in_batch if s]
+    existing_fields = supabase_db.fetch_existing_fields(skus_in_batch)
+    priced_with_category_fee = 0
+    price_lowered_by_fee = 0
+    fee_misread_fixed = 0
+    amazon_manual_kept = 0
+    ship_free = ship_paid = ship_unknown = ship_cells_changed = 0
+    ship_fees, ship_deltas = [], []
+
+    # Amazon rows are fetched up front in one Keepa batch (100 ASINs per
+    # call, 1 token each); the loop reads from this map. A failed fetch
+    # leaves those rows untouched this run, like an eBay fetch failure.
+    amazon_products, amazon_fetch_failed, ebay_tab_skus = {}, False, set()
+    amazon_asin_rows = {}  # first row seen per ASIN - later ones are duplicates
+
+    # ============ NEW-SKU UNIQUENESS GUARD (2026-09-17, user request) ========
+    # A SKU on more than one sheet row (any tab, any supplier) is ONE OnBuy
+    # listing flip-flopping between two products (the Makstore UPC
+    # incident) - every row involved freezes until a human picks one. A
+    # SINGLE row whose SKU already lives on the account is NOT an error:
+    # that is the adoption flow (user 2026-09-17 - sync existing products
+    # by their exact SKU or OPC + supplier link), and the create path's
+    # check_winning probe adopts it via plain update instead of creating a
+    # duplicate. Fails OPEN: a read error only logs and skips the check.
+    all_sku_counts = {}
+    all_link_counts, all_link_first = {}, {}
+    _link_entries = []   # (tab, row, supplier identity, live on OnBuy) in sheet order -> link_owners.build
+    try:
+        # PRODUCT tabs only (the first/eBay tab and the Amazon tab). System
+        # tabs carry a SKU column too - BuyBox mirrors every tracked
+        # listing - and counting them made a single legitimate adoption row
+        # look duplicated (Makstore 2026-09-17: "appears on 2 sheet rows"
+        # on rows that exist once, their twin being the BuyBox tracker).
+        _product_tabs = [sheet_tabs.product_sheet(spreadsheet)]
+        try:
+            _amz_tab = spreadsheet.worksheet("Amazon")
+            if _amz_tab.title != _product_tabs[0].title:
+                _product_tabs.append(_amz_tab)
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+        for _ws in _product_tabs:
+            _wh = [str(h).strip() for h in _ws.row_values(1)]
+            if "SKU" in _wh:
+                for _v in _ws.col_values(_wh.index("SKU") + 1)[1:]:
+                    _v = str(_v).replace(",", "").strip()
+                    if _v:
+                        all_sku_counts[_v] = all_sku_counts.get(_v, 0) + 1
+            # One supplier product = one listing (user 2026-09-21): map
+            # every parseable link identity to its OWNER row so every other
+            # row re-using the link freezes instead of listing the same
+            # source product a second time. The owner is the first row that
+            # is already LIVE on OnBuy, else the first row in sheet order
+            # (link_owners.py, 2026-10-05) - never "whichever row this run
+            # happens to reach first", which let a never-listed copy freeze
+            # the live original.
+            if "Supplier URL" in _wh:
+                _made = (_ws.col_values(_wh.index("OnBuy Product Created") + 1)[1:]
+                         if "OnBuy Product Created" in _wh else [])
+                for _ri, _v in enumerate(_ws.col_values(_wh.index("Supplier URL") + 1)[1:], start=2):
+                    _id = _supplier_identity(_v)
+                    if _id:
+                        _live = _ri - 2 < len(_made) and str(_made[_ri - 2]).strip().upper() == "TRUE"
+                        _link_entries.append((_ws.title, _ri, _id, _live))
+        all_link_counts, all_link_first = link_owners.build(_link_entries)
+    except Exception as exc:  # noqa: BLE001 - advisory guard, never fatal
+        logger.warning("SKU guard: sheet-wide count failed (%s) - duplicate check off this run", str(exc)[:120])
+        all_sku_counts = {}
+        all_link_counts, all_link_first = {}, {}
+    amazon_asins = sorted({keepa_client.parse_asin(row.get("Supplier URL"))
+                           for _, row in batch if supplier_of(row.get("Supplier URL")) == "Amazon"})
+    if amazon_asins:
+        try:
+            keepa = keepa_client.KeepaClient.from_env()
+        except PermanentError as exc:
+            logger.error("Keepa is not configured (%s) - aborting run without touching any rows", exc)
+            notify.send_alert_email(
+                "Keepa key missing - Amazon run aborted",
+                f"generate_xml.py ({sheet.title} tab) could not start the Keepa client: {exc}. "
+                "No sheet rows were touched. Add the KEEPA_API_KEY secret.")
+            sys.exit(1)
+        # Keepa prefetch / cache (keepa_cache.py, 2026-10-05): the slow, token-paced fetch runs in its own lock-free job and this
+        # run reads the answers back; whatever the cache lacks is fetched live, exactly as before.
+        _kc_started = datetime.now(timezone.utc)
+        _kc_payload = None
+        try:
+            amazon_products, _kc_cached, _kc_payload = keepa_cache.answers(
+                keepa, amazon_asins, sheet.title, KEEPA_CACHE, KEEPA_PREFETCH_ONLY, os.getenv("GITHUB_RUN_ID") or "",
+                KEEPA_CACHE_MAX_AGE_H, KEEPA_PREFETCH_REUSE_H)
+            if KEEPA_CACHE or KEEPA_PREFETCH_ONLY:
+                logger.info("Keepa cache: %d of %d ASIN(s) answered from the cache, %d fetched live",
+                            _kc_cached, len(amazon_asins), len(amazon_asins) - _kc_cached)
+            logger.info("Keepa: %d of %d ASIN(s) answered, %d token(s) used, %s left",
+                        len(amazon_products), len(amazon_asins), keepa.tokens_consumed, keepa.tokens_left)
+        except (TransientError, PermanentError) as exc:
+            amazon_fetch_failed = True
+            run_had_errors = True
+            logger.error("Keepa fetch failed for %d ASIN(s) - Amazon rows left untouched this run: %s",
+                         len(amazon_asins), exc)
+        if not amazon_fetch_failed:
+            # the real-price lookup (keepa_client.real_price_pass): the few products whose cheapest-offer price the Keepa guards refuse get a second look with the Buy Box
+            amazon_products.update(keepa.real_price_pass(amazon_products))
+        if KEEPA_PREFETCH_ONLY:
+            if amazon_fetch_failed:
+                logger.error("Keepa prefetch failed - nothing cached; the sync job will fetch live")
+                sys.exit(1)
+            keepa_cache.store(sheet.title, amazon_products, amazon_asins, _kc_payload,
+                              os.getenv("GITHUB_RUN_ID") or "", _kc_started)
+            logger.info("Keepa prefetch done: %d ASIN(s) answered, %d token(s) used - no OnBuy contact, no sheet writes",
+                        len(amazon_products), keepa.tokens_consumed)
+            return
+        # One product per SKU across tabs: an Amazon row whose SKU already
+        # lives on the eBay tab would collide on OnBuy and in Supabase.
+        if SHEET_TAB:
+            try:
+                _first = sheet_tabs.product_sheet(spreadsheet)
+                _fh = [str(h).strip() for h in _first.row_values(1)]
+                if "SKU" in _fh and _first.title != sheet.title:
+                    ebay_tab_skus = {str(v).replace(",", "").strip()
+                                     for v in _first.col_values(_fh.index("SKU") + 1)[1:]}
+            except Exception as exc:  # noqa: BLE001 - advisory guard, never fatal
+                logger.warning("Could not read the eBay tab's SKUs for the cross-tab check: %s", str(exc)[:120])
+
+    if KEEPA_PREFETCH_ONLY:
+        # no Amazon row in this run's batch (the branch above returns once it has cached the answers): nothing to prefetch
+        logger.info("Keepa prefetch: no Amazon row in this run's batch - nothing to fetch")
+        return
+
+    for idx, row in batch:
+        i = idx + 2
+        url = str(row.get("Supplier URL", "")).strip()
+        supplier = supplier_of(url)
+        if not supplier:
+            continue
+
+        # ebay_data keeps its historical name: it holds whichever supplier
+        # answered, in the shape empty_ebay_response() documents.
+        if supplier == "Amazon":
+            if amazon_fetch_failed:
+                fetch_failures += 1
+                continue
+            available, ebay_data = keepa_client.get_amazon_data(keepa_client.parse_asin(url), amazon_products)
+            ebay_data["brand"] = normalize_brand(ebay_data.get("brand") or "")
+        else:
+            try:
+                available, ebay_data = get_ebay_data(url, token)
+            except (TransientError, PermanentError) as exc:
+                fetch_failures += 1
+                run_had_errors = True
+                logger.error("Row %d (%s): fetch failed after retries, leaving existing values untouched - %s", i, url, exc)
+                if isinstance(exc, RateLimitError):
+                    # Every refused row costs ~7s of retries: after 20 in a row
+                    # the allowance is gone - stop instead of burning hours.
+                    _rl_streak += 1
+                    if _rl_streak >= 20:
+                        logger.error("eBay rate limit: %d fetches in a row refused - halting eBay fetches for this run",
+                                     _rl_streak)
+                        break
+                else:
+                    _rl_streak = 0
+                continue
+
+        _rl_streak = 0
+        stock = ebay_data["stock"]
+        cost_price = ebay_data["price"]
+
+        # When eBay reports the item unavailable (removed/no price/out of
+        # stock), ebay_data's descriptive fields are all blank - previously
+        # those blanks got written straight over the Sheet's existing good
+        # data, making the row look emptied out. Only stock/price/status
+        # should reflect "unavailable"; title/description/images/brand keep
+        # whatever was already there.
+        if available:
+            title = ebay_data["title"]
+            description = ebay_data["description"]
+            brand = ebay_data["brand"]
+            main_image = ebay_data["main_image"]
+            additional_images = ebay_data["additional_images"]
+        else:
+            title = str(row.get("Title") or "")
+            description = str(row.get("Description") or "")
+            brand = normalize_brand(str(row.get("Brand") or ""))
+            main_image = str(row.get("Image URL") or "")
+            additional_images = [img.strip() for img in str(row.get("Additional Images") or "").split(",") if img.strip()]
+
+        # ================= SKU (must be entered manually - OnBuy requires unique
+        # SKUs, and two different sourcing links can share the same barcode/item
+        # ID, so auto-deriving one risks a collision between two real products) ==
+        sku = str(row.get("SKU") or "").strip()
+        if not sku:
+            logger.warning("Row %d: no SKU provided (OnBuy requires a unique SKU per product) - skipping until one is added", i)
+            continue
+
+        # Amazon-tab guard, flagged in Sync Status and never pushed: a SKU
+        # already used on the eBay tab is one product listed twice. (The SKU
+        # is the seller's OWN barcode, as on the eBay tab - the manufacturer
+        # EANs Keepa lists are informational, never a match requirement.)
+        amazon_flag = ""
+        if supplier == "Amazon" and sku in ebay_tab_skus:
+            amazon_flag = "Failed: this SKU is already used on the eBay tab - one product per SKU"
+            logger.warning("Row %d (SKU %s): %s", i, sku, amazon_flag)
+        elif supplier == "Amazon":
+            # One Amazon product per row: the same ASIN under two SKUs would
+            # create two OnBuy listings of one supplier product (seen live:
+            # one mattress pasted on two rows). The OWNER keeps it: the first
+            # live row, else the first row in sheet order (link_owners.py) -
+            # the old "first row processed" claim froze live originals behind
+            # never-listed copies, because a batch runs never-listed rows first.
+            _dup_asin = keepa_client.parse_asin(url)
+            _aid = f"amazon:{_dup_asin}" if _dup_asin else ""
+            _dup_of = None
+            if all_link_first:
+                _own = all_link_first.get(_aid)
+                if _own and all_link_counts.get(_aid, 0) > 1 and _own != (sheet.title, i):
+                    _dup_of = _own
+            else:   # the sheet-wide table is unavailable this run: first row processed keeps it (the old rule)
+                _fr_old = amazon_asin_rows.setdefault(_dup_asin, i)
+                if _fr_old != i:
+                    _dup_of = (sheet.title, _fr_old)
+            if _dup_of:
+                amazon_flag = (f"Failed: ASIN {_dup_asin} is already used on row {_dup_of[1]}"
+                               f"{'' if _dup_of[0] == sheet.title else ' (' + _dup_of[0] + ')'} - one Amazon product per row")
+                logger.warning("Row %d (SKU %s): %s", i, sku, amazon_flag)
+        # Uniqueness guard (2026-09-17), every supplier and tab: a SKU on
+        # more than one sheet row freezes them ALL until a human picks one.
+        # A single row reusing a LIVE account SKU is adoption, not an error
+        # - the create path detects it and updates the existing listing.
+        if not amazon_flag and sku and all_sku_counts.get(sku, 0) > 1:
+            amazon_flag = f"Failed: SKU appears on {all_sku_counts[sku]} sheet rows - one product per SKU"
+            logger.warning("Row %d (SKU %s): %s", i, sku, amazon_flag)
+
+        # ============ SKU REGISTRY (2026-09-19, user directive) ============
+        # One barcode = one product, FOREVER. The Supabase mirror remembers
+        # every SKU's product (Title + Supplier URL) and survives sheet-row
+        # deletion, so a SKU re-pasted onto a DIFFERENT product freezes here
+        # before anything is priced or pushed. Same-listing relinks (same
+        # ASIN/item id) and same-product relinks (title still similar) pass;
+        # a mirror row without a stored title has nothing to compare against
+        # and fails open. Frozen rows never reach OnBuy and never overwrite
+        # the registry (their Supabase upsert is skipped at export time).
+        if not amazon_flag and sku:
+            _reg = existing_fields.get(sku, {})
+            _reg_title = str(_reg.get("Title") or "").strip()
+            _reg_url = str(_reg.get("Supplier URL") or "").strip()
+            if _reg_title:
+                _cur_id = _supplier_identity(url)
+                if not (_cur_id and _cur_id == _supplier_identity(_reg_url)) \
+                        and title and _title_similar(title, _reg_title) < 0.5:
+                    amazon_flag = (f"Failed: SKU is registered to '{_reg_title[:60]}' - one barcode = "
+                                   "one product; give this product its own new SKU")
+                    logger.warning("Row %d (SKU %s): %s (link now shows '%.60s')",
+                                   i, sku, amazon_flag, title)
+
+        # One supplier product = one listing (user 2026-09-21): a link
+        # already used on an earlier row must not be fetched and listed
+        # again as a second product of the same source.
+        if not amazon_flag and url:
+            _lid = _supplier_identity(url)
+            if _lid and all_link_counts.get(_lid, 0) > 1:
+                _ft, _fr = all_link_first.get(_lid, ("", 0))
+                if (_ft, _fr) != (sheet.title, i):
+                    amazon_flag = (f"Failed: supplier link already used on row {_fr} ({_ft}) "
+                                   "- one listing per supplier product")
+                    logger.warning("Row %d (SKU %s): %s", i, sku, amazon_flag)
+        # The categoriser reads text; Amazon's category tree is the best
+        # hint it can get, so it rides along with the description here only.
+        category_text = description if supplier != "Amazon" else f"{description} {ebay_data.get('category_path') or ''}"
+
+        # ================= CATEGORY (re-checked here with fresh title/description so a
+        # brand-new row gets categorized on this same pass, not just the upfront
+        # full-catalog remap above, which ran before this row's eBay data existed) ====
+        current_category = str(row.get("Category") or "").strip()
+        manual_unresolved = False
+        if is_valid_onbuy_category(current_category):
+            category = current_category
+            category_needs_write = False
+            if RECATEGORIZE_FROM_TYPE:
+                _by_type = (amazon_type_category(ebay_data.get("amazon_type")) if supplier == "Amazon" else "") or type_category(
+                    (ebay_data.get("product_type") or "") if isinstance(ebay_data, dict) else "",
+                    title, category_text)
+                if _by_type and _by_type != current_category:
+                    logger.info("Recategorized by eBay Type: %r -> %r", current_category, _by_type)
+                    category = _by_type
+                    category_needs_write = True
+        elif current_category:
+            # typed by a human - resolve (renames/ids/unique leaf) or keep as typed
+            category, _ok = resolve_manual_category(current_category, row.get("Category ID"))
+            category_needs_write = _ok and category != current_category
+            manual_unresolved = not _ok
+        else:
+            category = (amazon_type_category(ebay_data.get("amazon_type")) if supplier == "Amazon" else "") or \
+                map_onbuy_category(title, current_category, category_text,
+                                   (ebay_data.get("product_type") or "") if isinstance(ebay_data, dict) else "")
+            category_needs_write = category != current_category
+        category_id = category_id_by_path.get(category.strip().lower())
+
+        # ================= PRICING =================
+        # Default margin is a floor, not a fixed price: if a product's price
+        # already implies more than the default 40% total margin (20% fee +
+        # 20% profit), leave it alone - only bump prices UP that currently
+        # imply less than the default, never silently lower a price someone
+        # deliberately set higher. The decision itself is decide_price()
+        # (tested); this block feeds it the row's cells and acts on it.
+        # Delivery cost (user 2026-10-02): an eBay row's cost base includes what
+        # eBay charges to deliver the item - taken from the item fetch above (no
+        # extra API call) and written into the Shipping Cost (£) cell - but only
+        # for items whose eBay link states an exact fee (user 2026-10-03: "not for
+        # all"); free delivery writes nothing into a blank cell (shipping_cell_update).
+        # When eBay gave no exact cost (no options, a calculated fee, a
+        # non-GBP amount), the item is unavailable, the row is an Amazon one or
+        # EBAY_SHIPPING_COST=0, the cell stays as it is and its own number
+        # counts (blank, "free" or any text = 0). In "shadow" mode the quote is
+        # only measured and logged (end of run): nothing is written or priced.
+        _cell_shipping = _shipping_value(row.get("Shipping Cost (£)"))
+        _quote_wanted = ((EBAY_SHIPPING_COST or EBAY_SHIPPING_SHADOW) and available and supplier != "Amazon"
+                         and "Shipping Cost (£)" in col_map)
+        _quote = ebay_data.get("shipping_cost") if _quote_wanted else None
+        _ebay_shipping = _quote if EBAY_SHIPPING_COST else None
+        shipping_cost = _ebay_shipping if _ebay_shipping is not None else _cell_shipping
+        if _quote_wanted:
+            if _quote is None:
+                ship_unknown += 1
+            elif _quote == 0:
+                ship_free += 1
+            else:
+                ship_paid += 1
+                ship_fees.append(_quote)
+        _prev = existing_fields.get(sku, {})
+        # OnBuy's real commission for this category (fees.py, FEE_MODE=
+        # category), else the flat 20% assumption the formula grew up with.
+        fee_rule = fees.rule_for_category_id(category_id)
+        # Out-of-stock must never destroy the price: writing 0 into the
+        # Selling Price cell erased manually-raised prices (max() only
+        # protects what's still in the cell), and on restock the formula
+        # price silently replaced the manual one (Arden, user report
+        # 2026-08-28). Keep the price; stock 0 rides on its own column and
+        # push (stock-0 updates with a real price are valid - the OOS pass
+        # already pushes exactly that).
+        existing_price = _cell_number(row.get("Selling Price (£)")) or 0.0
+        _prev_rule = fees.rule_for_category_id(_prev.get("Category ID")) if _prev.get("Category ID") else None
+        _price = decide_price(supplier=supplier, cost_price=cost_price, shipping_cost=shipping_cost,
+                              fee_rule=fee_rule, existing_price=existing_price, fee_cell=row.get("Fee %"),
+                              profit_cell=row.get("Profit %"), prev=_prev,
+                              sheet_cost=_to_float(row.get("Cost Price (£)")),
+                              sheet_ship=_shipping_value(row.get("Shipping Cost (£)")), prev_fee_rule=_prev_rule)
+        _band_now = _price["band_now"]
+        profit_override, fee_override = _price["profit_override"], _price["fee_override"]
+        formula_price, selling_price = _price["formula_price"], _price["selling_price"]
+        if EBAY_SHIPPING_SHADOW and _quote is not None and _price["formula_price"] > 0:
+            # What the quote would do to this row's formula price (counted and logged at the end, nothing applied).
+            _with_quote = decide_price(supplier=supplier, cost_price=cost_price, shipping_cost=_quote,
+                                       fee_rule=fee_rule, existing_price=existing_price, fee_cell=row.get("Fee %"),
+                                       profit_cell=row.get("Profit %"), prev=_prev)
+            ship_deltas.append((_with_quote["formula_price"] / _price["formula_price"] - 1) * 100)
+        if _price["how"] == "amazon":
+            if 0 < formula_price < existing_price - 0.011:
+                price_lowered_by_fee += 1
+                logger.info("Row %d (SKU %s): Amazon price re-derived from current cost: %.2f -> %.2f",
+                            i, sku, existing_price, formula_price)
+        elif _price["how"] == "manual":
+            amazon_manual_kept += 1
+            logger.info("Row %d (SKU %s): Amazon price kept at %.2f - set by hand above the formula (%.2f)",
+                        i, sku, existing_price, formula_price)
+        elif _price["how"] == "follows":
+            price_lowered_by_fee += 1
+            if _price["misread"] and profit_override is None:
+                fee_misread_fixed += 1
+                logger.info("Row %d (SKU %s): price re-derived after the Fee %% misread fix: %.2f -> %.2f",
+                            i, sku, existing_price, formula_price)
+            else:
+                _basis = ("row overrides" if (profit_override is not None or fee_override is not None)
+                          else (fee_rule.name if fee_rule is not None else "band change"))
+                logger.info("Row %d (SKU %s): formula price follows the %s commission down: %.2f -> %.2f",
+                            i, sku, _basis, existing_price, formula_price)
+        if fee_rule is not None:
+            priced_with_category_fee += 1
+
+        # ================= PRICE CHECK FLAG =================
+        # Relative to the margin the formula gives THIS row (its band and
+        # its category's commission), so a cheap item in the 100% band is
+        # not "High" just for being priced by the book.
+        if stock == 0 or cost_price <= 0 or formula_price <= 0:
+            price_check_flag = ""
+        else:
+            margin_pct = (selling_price - cost_price) / cost_price * 100
+            formula_margin_pct = (formula_price - cost_price) / cost_price * 100
+            if margin_pct <= formula_margin_pct + PRICE_CHECK_NORMAL_OVER_PCT:
+                price_check_flag = "Normal"
+            elif margin_pct <= formula_margin_pct + PRICE_CHECK_MEDIUM_OVER_PCT:
+                price_check_flag = "Medium"
+            else:
+                price_check_flag = "High"
+
+        additional_images_str = ",".join(additional_images)
+        now_str = datetime.now(PK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        is_active = stock > 0
+
+        # ================= ONBUY API PUSH (gated, see ONBUY_API_PUSH_ENABLED) =================
+        # Runs before the sheet write below so the outcome (Sync Status, OPC
+        # placeholder, etc.) can go into the SAME batch_update call instead of
+        # a second Sheets API round-trip per row.
+        # EAN column (Sheet/Supabase): the SKU's numeric part IS the EAN
+        # (user policy 2026-07-13 - every product is a new listing under the
+        # seller's own barcode). eBay's own barcode is only a fallback for
+        # rows whose SKU somehow has no digits.
+        ean = sku_numeric_part(sku) or ebay_data.get("product_code") or ""
+        sync_status = amazon_flag or None
+        onbuy_product_created = None
+        onbuy_listing_active = None
+        onbuy_product_id = None
+        last_onbuy_sync = None
+
+        # Out of stock must never wait for a push slot (2026-09-21 mass-
+        # OOS flush: hundreds of rows went stock-0 in one run and their
+        # live zeroing trailed into the NEXT run's OOS pass - a 2-4h
+        # buyable window on dead sources). A created row that is out of
+        # stock but loses the gate below gets zeroed in one uncapped
+        # batch after the loop.
+        if (sku and onbuy_ready and onbuy_halt_reason is None and not amazon_flag
+                and stock == 0 and selling_price > 0
+                and not (should_push_to_onbuy(sku) and onbuy_pushes_this_run < ONBUY_MAX_PUSHES_PER_RUN)):
+            _status_now = str(existing_fields.get(sku, {}).get("Sync Status") or row.get("Sync Status") or "")
+            if _status_now.startswith(("Synced", "Pending Approval", "Awaiting OnBuy go-live")):
+                oos_missed_push.append((sku, selling_price))
+
+        # A frozen row is gated out of the pushes, but if its listing is LIVE and
+        # the supplier now shows it out of stock, zero it (always-safe direction).
+        if (sku and onbuy_ready and onbuy_halt_reason is None and amazon_flag
+                and stock == 0 and selling_price > 0
+                and str(existing_fields.get(sku, {}).get("OnBuy Product Created")
+                        or row.get("OnBuy Product Created") or "").strip().upper() == "TRUE"):
+            oos_missed_push.append((sku, selling_price))
+
+        if (sku and onbuy_ready and onbuy_halt_reason is None and not amazon_flag
+                and should_push_to_onbuy(sku) and onbuy_pushes_this_run < ONBUY_MAX_PUSHES_PER_RUN):
+            existing = existing_fields.get(sku, {})
+            # Supabase first, Sheet as fallback - the Sheet carries the same
+            # tracking columns (backfill writes both), so the guard below
+            # still works on a run where the Supabase pre-fetch failed.
+            last_sync_status = str(existing.get("Sync Status") or row.get("Sync Status") or "")
+
+            # A brand that's a registered trademark another seller already
+            # owns on OnBuy isn't a bug to route around - it's a real product
+            # this business isn't allowed to list under that brand at all.
+            # User's explicit policy (2026-07-06, superseding the earlier
+            # "mark it Unbranded and relist" policy): remove the row entirely
+            # instead of relisting it as Unbranded.
+            brand_skip, brand_stamp = brand_block_state(
+                (str(row.get("Sync Status") or ""), last_sync_status),
+                brand, datetime.now(PK_TZ).date())
+            if brand_skip:
+                # Policy changed 2026-08-03 (user): FLAG, never delete. The
+                # original delete-the-row rule was written for GTV's rare
+                # one-off rejections; at YRA's volume it silently destroyed
+                # 124+ rows in a day along with every record of WHICH brands
+                # bounced. The row now stays, turns amber, and stops being
+                # pushed - the team decides to re-source or re-brand.
+                onbuy_brand_blocked += 1
+                brand_alert = (f"BRAND BLOCKED ({brand_stamp}) - OnBuy says the brand "
+                               f"'{brand}' is owned by another seller, so this product cannot be "
+                               "listed under it. Replace the link with a different product, or "
+                               "correct the Brand cell - the row retries as soon as the brand "
+                               f"changes, and is re-tested anyway after {BRAND_BLOCK_RETRY_DAYS} days.")
+                # Full-auto sheets have no Change Alert column - Sync Status
+                # is where a human looks, so the instruction goes there.
+                all_sheet_updates.append(
+                    {"range": f"{col_letter(col_map['Sync Status'])}{i}", "values": [[brand_alert]]})
+                if "Change Alert" in col_map:
+                    all_sheet_updates.append(
+                        {"range": f"{col_letter(col_map['Change Alert'])}{i}", "values": [[brand_alert]]})
+                if "Last Checked Time" in col_map:
+                    all_sheet_updates.append(
+                        {"range": f"{col_letter(col_map['Last Checked Time'])}{i}", "values": [[now_str]]})
+                highlight_requests.append(
+                    row_highlight_request(sheet.id, i, num_cols, False))
+                logger.info(
+                    "Row %d (SKU %s): BRAND BLOCKED (%s) - flagged, not deleted, not pushed",
+                    i, sku, brand,
+                )
+                continue
+
+            onbuy_pushes_this_run += 1
+            # OnBuy's product code = the numeric part of the seller's own SKU
+            # (the pre-validated UPC; non-digit decoration around it is
+            # allowed and stripped). Being numeric and the right length isn't
+            # enough on its own - confirmed two real SKUs got rejected ("not
+            # a valid product code") despite both being 12-digit numbers,
+            # because their check digit isn't a real GS1/UPC checksum. Only
+            # forward it if it actually passes that check; otherwise send
+            # blank rather than repeat the rejection.
+            sku_digits = sku_numeric_part(sku)
+            upc_for_onbuy = sku_digits if is_valid_gtin(sku_digits) else ""
+
+            # OnBuy's own brand-matching backend can also crash outright on a
+            # brand it doesn't recognize ("MatchedBrandData...Argument #1
+            # ($id) must be of type int, null given") - that's a bug on their
+            # end, unrelated to trademark ownership, so it still gets retried
+            # as Unbranded rather than repeating the same crash.
+            brand_for_onbuy = brand
+            if "MatchedBrandData::__construct" in last_sync_status:
+                brand_for_onbuy = "Unbranded"
+
+            # "SKU does not exist" from update_listing does NOT always mean
+            # the product was never created. OnBuy's queue confirms a creation
+            # as success (OPC issued, findable in the Add Listing search) days
+            # before the listing becomes addressable via PUT /listings/by-sku
+            # - and falling back to create_product in that window re-submits
+            # the same product, which OnBuy answers with a NEW OPC instead of
+            # matching the existing record (confirmed 2026-07-06: most of the
+            # 07-04 rollout's products got duplicated this way on the next
+            # full run). So the create fallback is only allowed when our own
+            # records say this SKU was never successfully submitted: no real
+            # OPC on record and no submitted/synced status. Rows whose last
+            # submission outright Failed keep the fallback - re-creating is
+            # exactly how those recover.
+            opc_on_record = str(existing.get("OPC") or row.get("OPC") or "").strip()
+            already_created = (
+                opc_on_record.upper() not in ("", "PENDING")
+                or last_sync_status.startswith(("Synced", "Pending Approval", "Awaiting OnBuy go-live"))
+            )
+
+            try:
+                if not already_created and not available:
+                    # Dead sourcing link on a never-created row: eBay says
+                    # the listing is gone (404/no price), so there is no
+                    # title, price, or stock to build a product from - a
+                    # create can only ever fail. 31 such rows across the
+                    # Full-tier stores were red-flagging every run with "no
+                    # matching OnBuy category" (2026-08-06), retrying
+                    # forever. Skip the push: not an error, and deliberately
+                    # NOT "Failed" (that keyword reopens the create
+                    # fallback). The row keeps its Sheet/Supabase refresh
+                    # and pushes normally if the link starts resolving again
+                    # or is replaced. (Costs one push slot of the per-run
+                    # cap - not worth restructuring the loop over.)
+                    raise _SkipPushDead()
+                if not already_created and not str(main_image or "").strip():
+                    # OnBuy 400s a create whose default_image is empty (all
+                    # source images dead/rejected - 3 cases this week). A
+                    # data problem for a human, not a system fault: flag the
+                    # row and keep the run green; it retries the moment the
+                    # source gets working images.
+                    raise PermanentError("no usable product image - fix the source images or replace the link")
+                if not already_created and category_id is None:
+                    # A create can't succeed without a category (OnBuy 400s
+                    # on a null category_id), and the matcher now refuses to
+                    # guess rather than pick something wrong - flag the row
+                    # for a human instead of burning the API call on a known
+                    # rejection. Price/stock updates don't need a category,
+                    # so already-created rows are unaffected.
+                    raise PermanentError(
+                        "Category cell not recognised by OnBuy - check the spelling against the OnBuy category list (kept as typed)"
+                        if manual_unresolved else
+                        "no matching OnBuy category - fill in the Category column and it will retry")
+                if sku in PROTECTED_SKUS:
+                    raise _SkipPushProtected()
+                if not already_created and not ONBUY_CREATE_ENABLED:
+                    raise _SkipCreatePaused()
+                if already_created:
+                    if selling_price <= 0:
+                        raise _SkipPushNoPrice()
+                    result = onbuy.update_listing(sku=sku, price=selling_price, stock=stock, delivery_template_id=row_delivery_template(row))
+                    action = "updated"
+                else:
+                    # A row can reach the create path with its SKU ALREADY a
+                    # live listing - the team entered an old product without
+                    # "Synced" (Makstore 2026-08-28: 86 rows create-pathed
+                    # into phantom queue entries). One check-winning call
+                    # answers only for existing listings, so a hit means
+                    # adopt via the plain update; any check failure falls
+                    # through to the normal create.
+                    _live_hit = False
+                    try:
+                        _res = onbuy.check_winning([sku]) or []
+                        # An entry can carry the SKU WITH an error field
+                        # ("SKU not found") for non-existent SKUs - only an
+                        # error-free entry proves a live listing (YRA
+                        # 2026-08-29: the guard rerouted 3 fresh creates
+                        # into doomed updates).
+                        _live_hit = any(
+                            str((_e or {}).get("sku") or "").strip() == sku
+                            and not str((_e or {}).get("error") or "").strip()
+                            for _e in _res)
+                    except Exception as _exc:
+                        logger.info("live-SKU pre-create check failed for %s (%s) - proceeding with create", sku, str(_exc)[:80])
+                    if _live_hit:
+                        logger.info("SKU %s is already a live listing - adopting via update instead of creating a duplicate", sku)
+                        result = onbuy.update_listing(sku=sku, price=selling_price, stock=stock, delivery_template_id=row_delivery_template(row))
+                        action = "updated"
+                    else:
+                        action, result = onbuy.sync_product(
+                            sku=sku,
+                            ean=upc_for_onbuy,
+                            title=title or str(row.get("Title") or ""),
+                            description=description,
+                            brand=brand_for_onbuy,
+                            category_id=category_id,
+                            price=selling_price,
+                            stock=stock,
+                            main_image=main_image,
+                            additional_images=additional_images,
+                        )
+                logger.info("OnBuy %s: %s", action, sku)
+                # Stamp ONLY updates. OnBuy confirmed (support, 2026-08-11)
+                # that product-create IGNORES the embedded price/stock by
+                # design: the listing is born 0/0 and inactive, and only a
+                # follow-up by-SKU update activates it (~30 min processing).
+                # Stamping on create rotated the fresh row to the BACK of a
+                # multi-day queue, so the activating update arrived days
+                # late - after OnBuy's "Price below minimum" auto-suspension
+                # had already fired, and suspended listings reject all
+                # edits. An unstamped created row keeps front-of-queue
+                # priority: the very next run sends the activating update
+                # while the listing is still editable.
+                if action == "updated":
+                    last_onbuy_sync = now_str
+                if action == "created":
+                    onbuy_created += 1
+                    # Accepted into OnBuy's async approval queue - not confirmed live yet.
+                    # The real OPC/approval status only appears later via
+                    # OnBuyClient.check_queue(); this pipeline doesn't poll for it, so
+                    # these reflect "submitted", not "confirmed active".
+                    sync_status = "Pending Approval"
+                    onbuy_product_created = "TRUE"
+                    onbuy_listing_active = "FALSE"
+                    onbuy_product_id = str(result.get("queue_id", "")) if isinstance(result, dict) else ""
+                else:
+                    onbuy_updated += 1
+                    sync_status = "Synced"
+                    onbuy_product_created = "TRUE"
+                    onbuy_listing_active = "TRUE"
+            except _SkipPushNoPrice:
+                onbuy_no_price += 1
+                logger.info(
+                    "Row %d (SKU %s): no usable selling price - push skipped, not failed "
+                    "(the OOS pass zeroes stock with the listing price)", i, sku)
+            except _SkipPushProtected:
+                onbuy_protected += 1
+                logger.info("Row %d (SKU %s): PROTECTED - OnBuy content repair pending, push skipped", i, sku)
+            except _SkipCreatePaused:
+                onbuy_create_paused += 1
+                logger.info("Row %d (SKU %s): create PAUSED (ONBUY_CREATE_ENABLED=false) - waiting", i, sku)
+            except _SkipPushDead:
+                onbuy_skipped_dead += 1
+                if supplier == "Amazon":
+                    # Keepa often cannot see a price for one cycle (Amazon
+                    # suppresses the Buy Box; no current New price) even
+                    # though the product page sells fine - the next sweep
+                    # picks it up. Only a persistent skip means the link
+                    # itself needs a look.
+                    sync_status = ("Skipped: no buyable offer visible on Amazon right now - "
+                                   "retried automatically every run; check the link only if this persists")
+                else:
+                    sync_status = "Skipped: eBay listing unavailable - replace or remove the link"
+                logger.info(
+                    "Row %d (SKU %s): %s listing unavailable and never created on OnBuy "
+                    "- nothing to create, skipping the push", i, sku, supplier)
+            except (TransientError, AuthError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                # OnBuy-side or transport trouble (rate limit, 5xx after
+                # retries, expired token even after the client's one re-auth,
+                # network blip) - the product itself was NOT rejected, so
+                # leave Sync Status exactly as it was: writing "Failed" here
+                # would reopen the create fallback for a recently created row
+                # whose real OPC hasn't been backfilled yet, and re-creating
+                # is exactly how the 07-06 duplicates were minted. No Last
+                # OnBuy Sync stamp either, so these rows keep their place at
+                # the front of the push order next run.
+                # (AuthError subclasses PermanentError, so it must be listed
+                # here, before the PermanentError handler below.)
+                onbuy_postponed += 1
+                # Postponed pushes are SELF-HEALING by design (status
+                # untouched, front-of-queue retry next run), so a scattered
+                # network blip or a rate-limit halt doesn't red the run -
+                # hitting the 240/hr cap is the cap doing its job, seen
+                # whenever a manual run shares an hour with a scheduled one
+                # (2026-08-06). A token that can't refresh IS a real fault:
+                # nothing will push until someone fixes credentials.
+                if isinstance(exc, AuthError):
+                    run_had_errors = True
+                logger.warning("OnBuy push postponed for SKU %s: %s", sku, exc)
+                if isinstance(exc, (RateLimitError, AuthError)):
+                    # The hourly quota won't come back mid-run, and a token
+                    # that couldn't be refreshed won't start working again -
+                    # pushing on would just burn time failing row after row.
+                    onbuy_halt_reason = str(exc)[:200]
+                    logger.warning(
+                        "Halting OnBuy pushes for the rest of this run (%s) - remaining rows "
+                        "still get their Sheet/Supabase refresh and will push next run",
+                        onbuy_halt_reason,
+                    )
+            except PermanentError as exc:
+                if already_created and "SKU does not exist" in str(exc):
+                    # Created earlier, OnBuy just hasn't made the listing
+                    # addressable yet - not a failure, and NOT a reason to
+                    # re-create. Stamp Last OnBuy Sync so this row rotates to
+                    # the back of the push-priority order (batch sort above)
+                    # instead of holding a front slot every run; the update
+                    # will simply succeed on a later attempt once OnBuy makes
+                    # the listing live.
+                    onbuy_deferred += 1
+                    sync_status = "Awaiting OnBuy go-live (created earlier - listing not yet updatable)"
+                    last_onbuy_sync = now_str
+                    logger.info(
+                        "Row %d (SKU %s): created earlier (OPC %s) but OnBuy's listing isn't "
+                        "updatable yet - deferring, not re-creating",
+                        i, sku, opc_on_record or "pending",
+                    )
+                elif already_created and "suspended listings cannot be edited" in str(exc).lower():
+                    # The listing exists but OnBuy has it suspended (e.g. the
+                    # zero-price auto-suspension) and rejects every edit until
+                    # the suspension lifts. NOT "Failed" - on a row with no
+                    # OPC on record that reopens the create fallback and mints
+                    # a duplicate product. Keep the created-guard satisfied,
+                    # stamp the sync so the row rotates instead of holding a
+                    # front slot, and retry on every future visit; the moment
+                    # OnBuy reactivates the listing the update just succeeds.
+                    onbuy_suspended_locked += 1
+                    sync_status = "Synced (suspended on OnBuy - awaiting reactivation)"
+                    last_onbuy_sync = now_str
+                    logger.info(
+                        "Row %d (SKU %s): listing suspended on OnBuy - edits rejected until "
+                        "reactivation, will keep retrying on rotation", i, sku)
+                elif "no usable product image" in str(exc):
+                    # Same worklist treatment as the category case: a human
+                    # fixes the source images; the run stays green.
+                    onbuy_needs_category += 1
+                    sync_status = f"Failed: {str(exc)[:300]}"
+                    logger.warning("SKU %s needs working images before it can list: %s", sku, exc)
+                elif "no matching OnBuy category" in str(exc):
+                    # A product waiting for its Category cell is a WORKLIST
+                    # item, not a system failure (2026-08-06): with a growing
+                    # catalog every run carries a few brand-new no-Type
+                    # products, so exiting 1 for them kept the workflow
+                    # permanently red - which buried the failures that
+                    # matter. The status keeps the exact "Failed: no
+                    # matching OnBuy category" wording (the create-fallback
+                    # and autofill's gate both key on it) and the row
+                    # retries the moment a category lands; the run itself
+                    # stays green.
+                    onbuy_needs_category += 1
+                    sync_status = f"Failed: {str(exc)[:300]}"
+                    logger.warning("SKU %s needs a category before it can list: %s", sku, exc)
+                else:
+                    onbuy_failed += 1
+                    run_had_errors = True
+                    sync_status = f"Failed: {str(exc)[:300]}"
+                    logger.error("OnBuy push failed for SKU %s: %s", sku, exc)
+            except Exception as exc:
+                onbuy_failed += 1
+                run_had_errors = True
+                # Previously just "Failed" with no reason - the actual cause
+                # only ever reached the run's log, not anywhere the user could
+                # see it without downloading that specific Actions run's log.
+                sync_status = f"Failed: {str(exc)[:300]}"
+                logger.error("OnBuy push failed for SKU %s: %s", sku, exc)
+            # Confirmed from the account's own API usage page: 240 PUT/POST per
+            # hour. Paired with ONBUY_MAX_PUSHES_PER_RUN above, this keeps a
+            # single large run from bursting through the hourly limit on its own.
+            time.sleep(0.5)
+
+        row_updates = [
+            {"range": f"{col_letter(col_map['Cost Price (£)'])}{i}", "values": [[cost_price]]},
+            {"range": f"{col_letter(col_map['Stock'])}{i}", "values": [[stock]]},
+            {"range": f"{col_letter(col_map['Selling Price (£)'])}{i}", "values": [[selling_price]]},
+            {"range": f"{col_letter(col_map['Status'])}{i}", "values": [["ACTIVE" if is_active else "INACTIVE"]]},
+            {"range": f"{col_letter(col_map['Description'])}{i}", "values": [[description]]},
+            {"range": f"{col_letter(col_map['Image URL'])}{i}", "values": [[main_image]]},
+            {"range": f"{col_letter(col_map['Additional Images'])}{i}", "values": [[additional_images_str]]},
+            {"range": f"{col_letter(col_map['Brand'])}{i}", "values": [[brand]]},
+            {"range": f"{col_letter(col_map['Title'])}{i}", "values": [[title]]},
+            {"range": f"{col_letter(col_map['Last Updated'])}{i}", "values": [[now_str]]},
+            {"range": f"{col_letter(col_map['Last Checked Time'])}{i}", "values": [[now_str]]},
+        ]
+        if category_needs_write:
+            row_updates.append({"range": f"{col_letter(col_map['Category'])}{i}", "values": [[category]]})
+        if "Price Check Flag" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['Price Check Flag'])}{i}", "values": [[price_check_flag]]})
+        # The percentage columns are written only while they hold the
+        # automation's own value - a manual override stays exactly as typed.
+        if "Fee %" in col_map and fee_override is None:
+            _fee_shown = (pricing.effective_fee_percent(selling_price, fee_rule) if selling_price > 0
+                          else pricing.effective_rate(fee_rule.lower_pct if fee_rule else float(pricing.PLATFORM_FEE_PERCENT)))
+            row_updates.append({"range": f"{col_letter(col_map['Fee %'])}{i}",
+                                "values": [[f"{_fee_shown:.2f}"]]})
+        _profit_shown = _price["profit_shown"]
+        if "Profit %" in col_map and profit_override is None and _profit_shown is not None:
+            row_updates.append({"range": f"{col_letter(col_map['Profit %'])}{i}",
+                                "values": [[_pct_text(_profit_shown)]]})
+        # eBay's stated delivery fee goes into the Shipping Cost (£) cell (shipping_cell_update decides: a number for
+        # a stated fee, nothing for free delivery on a blank cell; shadow mode only counts it).
+        _ship_write = shipping_cell_update(_quote, row.get("Shipping Cost (£)"))
+        if _ship_write is not None:
+            ship_cells_changed += 1
+            if EBAY_SHIPPING_COST:
+                row_updates.append({"range": f"{col_letter(col_map['Shipping Cost (£)'])}{i}",
+                                    "values": [[_ship_write]]})
+        if "Condition" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['Condition'])}{i}",
+                                "values": [[ebay_data.get("condition") or "New"]]})
+        if "EAN" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['EAN'])}{i}", "values": [[ean]]})
+        if supplier == "Amazon":
+            for _col, _key in (("ASIN", "asin"), ("Amazon Seller", "amazon_seller"),
+                               ("Amazon Availability", "amazon_availability"), ("Keepa Updated", "keepa_updated")):
+                if _col in col_map:
+                    row_updates.append({"range": f"{col_letter(col_map[_col])}{i}",
+                                        "values": [[str(ebay_data.get(_key) or "")]]})
+        # OnBuy-provided tracking fields, written to the Sheet only if those
+        # columns exist there and only when a push actually happened this run
+        # - otherwise leaving them out preserves whatever was already there.
+        if sync_status and "Sync Status" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['Sync Status'])}{i}", "values": [[sync_status]]})
+        if onbuy_product_created and "OnBuy Product Created" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['OnBuy Product Created'])}{i}", "values": [[onbuy_product_created]]})
+        if onbuy_listing_active and "OnBuy Listing Active" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['OnBuy Listing Active'])}{i}", "values": [[onbuy_listing_active]]})
+        if onbuy_product_id and "OnBuy Product ID" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['OnBuy Product ID'])}{i}", "values": [[onbuy_product_id]]})
+        if last_onbuy_sync and "Last OnBuy Sync" in col_map:
+            row_updates.append({"range": f"{col_letter(col_map['Last OnBuy Sync'])}{i}", "values": [[last_onbuy_sync]]})
+
+        all_sheet_updates.extend(row_updates)
+        updated_count += 1
+        logger.info("Processed row %d", i)
+        # Red = needs a human: out of stock OR any Failed/guard-frozen
+        # status (user 2026-09-22: frozen rows were invisible before -
+        # only stock-0 rows went red).
+        _row_ok = is_active and not str(sync_status or "").startswith("Failed")
+        highlight_requests.append(row_highlight_request(sheet.id, i, num_cols, _row_ok))
+        time.sleep(0.2)  # light pacing on eBay fetches; OnBuy pushes are paced separately below
+
+        # ================= SUPABASE EXPORT ROW (upserted once after the loop) =================
+        # Every row - including OnBuy-tracking fields - goes in this one list,
+        # and every row must have identical keys AND real values for every NOT
+        # NULL column (see fetch_existing_fields() for why a separate
+        # partial-column upsert doesn't work here).
+        existing = existing_fields.get(sku, {})
+        supabase_row = {
+            "SKU": sku,
+            "Title": title or str(row.get("Title") or ""),
+            "Description": description,
+            "Brand": brand,
+            "Category": category,
+            "Category ID": str(category_id) if category_id is not None else None,
+            "Supplier URL": url,
+            "Supplier": supplier,
+            "Cost Price (£)": cost_price,
+            "Shipping Cost (£)": str(shipping_cost) if shipping_cost else None,
+            # The automation's own view, never a row's override: this is the
+            # baseline resolve_pct_cell compares the sheet cells against, so
+            # storing an override here would make it look automation-written
+            # and get it clobbered next basis change. GTV's columns are
+            # integer-typed in Postgres ("0.00" bounced the whole 375-row
+            # upsert with 22P02 on the first category run), so send whole
+            # numbers - the sheet keeps the 2-decimal display.
+            "Profit %": str(int(round(_profit_shown if _profit_shown is not None else (_band_now or 0)))),
+            "Fee %": str(int(round(pricing.effective_fee_percent(selling_price, fee_rule)
+                                   if selling_price > 0 else
+                                   pricing.effective_rate(fee_rule.lower_pct if fee_rule else pricing.PLATFORM_FEE_PERCENT)))),
+            "Stock": stock,
+            "Selling Price (£)": selling_price,
+            "Status": "ACTIVE" if stock > 0 else "INACTIVE",
+            "Last Updated": datetime.now(PK_TZ).isoformat(),
+            "Image URL": main_image,
+            "Additional Images": additional_images_str,
+            "Condition": ebay_data.get("condition") or "New",
+            "Last Checked Time": datetime.now(PK_TZ).isoformat(),
+            "EAN": ean,
+            "Listing ID": str(row.get("Listing ID") or "").strip() or None,
+            # OPC (OnBuy's permanent product code) is only known once the async
+            # queue clears - see OnBuyClient.check_queue(). This column is NOT
+            # NULL, so a genuinely new row needs a placeholder - but reuse the
+            # real value from Supabase if backfill_onbuy_status.py already
+            # found one, instead of stomping it back to "PENDING" every run.
+            "OPC": existing.get("OPC") or "PENDING",
+            # OnBuy-tracking fields: use this run's fresh value if a push was
+            # attempted, otherwise carry forward whatever was already there
+            # (never blank it out) - see fetch_existing_fields() for why
+            # these have to live on the same row as the fields above rather
+            # than a separate partial-column upsert.
+            "Sync Status": sync_status or existing.get("Sync Status") or "",
+            # These three are boolean/boolean/timestamp under the canonical
+            # schema, so "" is not a legal value for any of them - see
+            # carry_forward(). "FALSE" is the truthful default for a row
+            # never pushed (not created, not live); NULL for a sync that
+            # never happened.
+            "OnBuy Product Created": carry_forward(onbuy_product_created, existing.get("OnBuy Product Created"), "FALSE"),
+            "OnBuy Listing Active": carry_forward(onbuy_listing_active, existing.get("OnBuy Listing Active"), "FALSE"),
+            "OnBuy Product ID": onbuy_product_id or existing.get("OnBuy Product ID") or "",
+            "Last OnBuy Sync": carry_forward(last_onbuy_sync, existing.get("Last OnBuy Sync")),
+        }
+        # A frozen row (one-product-per-SKU / registry conflict) must not
+        # overwrite the registry with the conflicting product's content -
+        # the sheet carries its Failed status; the mirror keeps the record
+        # of the product this SKU actually belongs to.
+        if not amazon_flag:
+            supabase_rows.append(supabase_row)
+
+    # ============ UNCAPPED OOS ZERO BATCH (2026-09-21) ============
+    # Rows that went out of stock this run but missed a push slot: zero
+    # their live stock NOW, outside the cap, exactly like the start-of-
+    # run OOS pass (which remains the catch-all if this batch bounces).
+    if oos_missed_push and ONBUY_API_PUSH_ENABLED and onbuy_ready and onbuy_halt_reason is None:
+        logger.info("OOS batch: zeroing %d row(s) that went out of stock beyond this run's push slots",
+                    len(oos_missed_push))
+        for _c in range(0, len(oos_missed_push), 500):
+            _chunk = oos_missed_push[_c:_c + 500]
+            try:
+                _results = onbuy.update_listings_by_sku_batch([(s, p, 0) for s, p in _chunk])
+                _errs = {str((it or {}).get("sku") or "").strip(): str((it or {}).get("error") or "").strip()
+                         for it in _results or []}
+                _ok = sum(1 for s, _p in _chunk if not _errs.get(s, "missing"))
+                logger.info("OOS batch: %d zeroed, %d bounced", _ok, len(_chunk) - _ok)
+            except Exception as exc:  # noqa: BLE001 - next run's OOS pass covers it
+                logger.error("OOS batch failed (next run's OOS pass covers it): %s", exc)
+
+    # ================= APPLY ALL SHEET VALUE UPDATES (one call for the whole run) =================
+    _rows_shifted_at_flush = False
+    # An edit made to a price / override cell while this run was in progress wins over what the run worked out from its
+    # start-of-run snapshot (see drop_edited_cells). Best effort: any trouble reading the columns just skips the guard.
+    _guarded = {col_letter(col_map[_c]): _c for _c in ("Selling Price (£)", "Profit %", "Fee %") if _c in col_map}
+    if all_sheet_updates and _guarded:
+        try:
+            _fresh_sku = with_retry(lambda: sheet.col_values(col_map["SKU"]), what="sku column before the guard", max_attempts=3)
+            _fresh_cols = {_c: with_retry(lambda _c=_c: sheet.col_values(col_map[_c]), what=f"{_c} column before the guard", max_attempts=3)
+                           for _c in _guarded.values()}
+
+            def _fresh_value(_c, _n):
+                _col = _fresh_cols[_c]
+                return _col[_n - 1] if _n - 1 < len(_col) else ""
+
+            def _snap_value(_c, _n):
+                return data[_n - 2].get(_c, "") if 0 <= _n - 2 < len(data) else ""
+
+            all_sheet_updates, _edited = drop_edited_cells(all_sheet_updates, _guarded, sku_display, _snap_value,
+                                                           _fresh_sku, _fresh_value)
+            if _edited:
+                logger.warning("Edited while this run was in progress - %d cell write(s) skipped, the new value stays: %s",
+                               len(_edited), "; ".join(f"{_s} {_c}={_v}" for _s, _c, _v in _edited[:25]))
+                _mirror_by_sku = {str(_r.get("SKU")): _r for _r in supabase_rows}
+                for _s, _c, _v in _edited:
+                    if _c == "Selling Price (£)" and _s in _mirror_by_sku and _cell_number(_v) is not None:
+                        _mirror_by_sku[_s]["Selling Price (£)"] = _cell_number(_v)
+        except Exception as exc:  # noqa: BLE001 - the guard must never block the flush
+            logger.warning("Edit guard skipped (%s) - the run's values are written as computed", str(exc)[:200])
+    if all_sheet_updates:
+        all_sheet_updates, _rows_shifted_at_flush = _remap_row_writes(all_sheet_updates, "run sheet writes")
+    if all_sheet_updates:
+        # gspread's batch_update() mutates each dict's "range" in place
+        # (unconditionally re-qualifying it with the sheet name, even if
+        # already qualified - confirmed from its source). Passing the same
+        # list to a retried call would double-qualify the range on the 2nd
+        # attempt ('eBay'!'eBay'!I35), which is invalid and fails outright.
+        # Keep the original (range, values) pairs immutable and rebuild fresh
+        # dicts on every attempt so a retry never sees an already-mutated one.
+        original_pairs = [(u["range"], u["values"]) for u in all_sheet_updates]
+
+        # Written in size-bounded chunks (2026-10-01): one request carrying a
+        # 2,400-row run (descriptions + image lists) risks Google's request
+        # size limit and was all-or-nothing. A chunk that fails after its
+        # retries is logged and the others still land.
+        def _sheet_chunks(pairs, max_ranges=4000, max_bytes=2_500_000):
+            cur, size = [], 0
+            for rng, vals in pairs:
+                sz = len(rng) + len(json.dumps(vals, ensure_ascii=False)) + 40
+                if cur and (len(cur) >= max_ranges or size + sz > max_bytes):
+                    yield cur
+                    cur, size = [], 0
+                cur.append((rng, vals))
+                size += sz
+            if cur:
+                yield cur
+
+        _chunk_failed = 0
+        for _part in _sheet_chunks(original_pairs):
+            def _do_sheet_update(part=_part):
+                return sheet.batch_update([{"range": r, "values": v} for r, v in part])
+
+            try:
+                with_retry(_do_sheet_update, what="sheet batch update", max_attempts=3)
+            except Exception as exc:
+                _chunk_failed += 1
+                run_had_errors = True
+                logger.error("Sheet batch update chunk failed after retries - part of this run's "
+                             "Sheet changes may not be saved: %s", exc)
+        if _chunk_failed:
+            logger.error("%d sheet write chunk(s) failed", _chunk_failed)
+
+    supabase_rows = dedupe_rows_by_sku(supabase_rows, "Supabase export")
+    supabase_ok = supabase_db.upsert_products(supabase_rows)
+
+    if highlight_requests and _rows_shifted_at_flush:
+        # Formatting requests address grid rows directly and cannot be
+        # SKU-remapped - cosmetic, so skip them for this run.
+        logger.warning("Row highlights skipped - sheet rows moved during the run; they re-apply next run")
+        highlight_requests = []
+    if highlight_requests:
+        try:
+            with_retry(
+                sheet.spreadsheet.batch_update,
+                {"requests": highlight_requests},
+                what="row highlight formatting",
+                max_attempts=3,
+            )
+        except Exception as exc:
+            logger.error("Row highlighting failed (values were still updated correctly): %s", exc)
+
+    # ================= REMOVE BRAND-REJECTED ROWS ENTIRELY =================
+    # Runs after every other Sheet write/highlight above so deleting these
+    # rows can't shift row numbers out from under one of those, which only
+    # ever target rows that are staying (a row queued for deletion `continue`d
+    # past building any Sheet update for itself). Supabase is deleted first,
+    # not the Sheet row - if the Sheet delete then fails, the row survives to
+    # be retried (and re-rejected, re-detected, re-deleted) next run; the
+    # reverse order would risk a permanently orphaned Supabase row with no
+    # Sheet row left to ever trigger cleaning it up.
+    if rows_to_delete and _rows_shifted_at_flush:
+        # Deleting by stale row numbers would remove the wrong rows - the
+        # same products re-flag and delete cleanly next run.
+        logger.warning("Brand-rejected row deletion skipped - sheet rows moved during the run; redone next run")
+        rows_to_delete = []
+    if rows_to_delete:
+        supabase_db.delete_products(removed_skus)
+        delete_requests = [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet.id,
+                        "dimension": "ROWS",
+                        "startIndex": row_num - 1,
+                        "endIndex": row_num,
+                    }
+                }
+            }
+            for row_num in sorted(set(rows_to_delete), reverse=True)
+        ]
+        try:
+            with_retry(
+                sheet.spreadsheet.batch_update,
+                {"requests": delete_requests},
+                what="delete brand-rejected rows",
+                max_attempts=3,
+            )
+            logger.info(
+                "Removed %d row(s) entirely - brand owned by another seller (SKUs: %s)",
+                len(rows_to_delete), ", ".join(removed_skus),
+            )
+        except Exception as exc:
+            run_had_errors = True
+            logger.error(
+                "Failed to delete brand-rejected row(s) from the Sheet (Supabase row(s) "
+                "already removed) - SKUs %s: %s", ", ".join(removed_skus), exc,
+            )
+
+    # ================= GENERATE XML (kept as fallback) =================
+    root = ET.Element("products")
+    feed_count = 0
+    skipped_feed = 0
+
+    # The hosted XML is a catalogue mirror written AFTER all the real work (sheet, OnBuy, Supabase) is done. A Google blip while re-reading the sheet for it
+    # (Makstore 2026-10-12 17:43Z: a 503, then a 404 "Requested entity was not found") must not turn a finished sync red: retry, and when it still fails
+    # keep the previous hosted copy - never upload an empty feed.
+    try:
+        _feed_rows = with_retry(sheet.get_all_records, what="feed read", max_attempts=3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("feed read failed (%s) - the hosted XML copy is left as it was this run", str(exc)[:160])
+        _feed_rows = None
+
+    for row in (_feed_rows or []):
+        try:
+            sku = str(row.get("SKU") or "").strip()
+            title = str(row.get("Title") or "").strip()
+            desc = str(row.get("Description") or "").strip()
+            brand = str(row.get("Brand") or "").strip()
+            category = clean_category(row.get("Category"))
+            image = to_jpg(row.get("Image URL"))
+            additional_images = [img.strip() for img in str(row.get("Additional Images") or "").split(",") if img.strip()][:10]
+            price = float(row.get("Selling Price (£)") or 0)
+            stock = int(row.get("Stock") or 0)
+
+            if not all([sku, title, category]):
+                skipped_feed += 1
+                continue
+
+            product = ET.SubElement(root, "product")
+            ET.SubElement(product, "sku").text = sku
+            ET.SubElement(product, "product_name").text = title[:150]
+            ET.SubElement(product, "description").text = desc
+            ET.SubElement(product, "image_url").text = image
+
+            for img_idx, img in enumerate(additional_images):
+                ET.SubElement(product, f"additional_image_url_{img_idx + 1}").text = img
+
+            ET.SubElement(product, "brand").text = brand
+            ET.SubElement(product, "category").text = category
+            ET.SubElement(product, "condition").text = "New"
+            ET.SubElement(product, "ean").text = sku
+            ET.SubElement(product, "price").text = str(price)
+            ET.SubElement(product, "quantity").text = str(stock)
+
+            feed_count += 1
+        except Exception:
+            skipped_feed += 1
+
+    # Supabase Storage rejects objects over its size cap (OpenMaal's feed of
+    # ~5,700 products with full HTML descriptions got 413 "Payload too large"
+    # on every run, 2026-08-22). The hosted feed is a catalogue mirror, not
+    # what OnBuy reads (the API pushes are), so when the document is too big
+    # shorten the descriptions rather than fail the upload.
+    FEED_MAX_BYTES = 40 * 1024 * 1024
+    feed_bytes = ET.tostring(root, encoding="utf-8")
+    if len(feed_bytes) > FEED_MAX_BYTES:
+        for _d in root.iter("description"):
+            if _d.text and len(_d.text) > 400:
+                _d.text = _d.text[:400]
+        feed_bytes = ET.tostring(root, encoding="utf-8")
+        logger.info("Feed over %d MB - descriptions shortened to 400 chars for the hosted copy (now %.1f MB)",
+                    FEED_MAX_BYTES // (1024 * 1024), len(feed_bytes) / (1024 * 1024))
+    if _feed_rows is None:
+        feed_url = None        # nothing to publish this run: the previous hosted copy stays
+    else:
+        ET.ElementTree(root).write(FEED_FILE, encoding="utf-8", xml_declaration=True)
+        feed_url = storage.upload_feed(local_path=FEED_FILE, remote_path=FEED_FILE)
+
+    # ================= FINAL LOGS + ALERTS =================
+    logger.info("DONE")
+    logger.info("Updated rows: %d", updated_count)
+    if fees.enabled():
+        logger.info("Pricing: %d row(s) priced with their category's commission, %d formula price(s) followed it down",
+                    priced_with_category_fee, price_lowered_by_fee)
+    if fee_misread_fixed:
+        logger.info("Fee %% misread fix: %d price(s) re-derived with the category's own commission", fee_misread_fixed)
+    if amazon_manual_kept:
+        logger.info("Amazon prices kept above the formula (set by hand): %d", amazon_manual_kept)
+    if keepa_client.REGULAR_LIFTED:
+        logger.info("Amazon prices taken from the usual level instead of a deal / voucher / sale price: %d", keepa_client.REGULAR_LIFTED)
+    if keepa_client.DROP_HELD:
+        logger.info("Amazon offers held because their price fell below %d%% of the usual level (error price / glitch), read as unavailable: %d",
+                    int(keepa_client.DROP_HOLD_PERCENT), keepa_client.DROP_HELD)
+    if keepa_client.REAL_PRICE_USED:
+        logger.info("Amazon prices taken from the Buy Box because the cheapest-offer price was refused (phantom Amazon offer / error price): %d", keepa_client.REAL_PRICE_USED)
+    if ship_free or ship_paid or ship_unknown:
+        logger.info("eBay delivery cost%s: %d free, %d paid (fee GBP mean %.2f, median %.2f, p90 %.2f, max %.2f), "
+                    "%d not stated by eBay (cell left as it was); %d Shipping Cost cell(s) %s",
+                    " (SHADOW - nothing written or repriced)" if EBAY_SHIPPING_SHADOW else "",
+                    ship_free, ship_paid, (sum(ship_fees) / len(ship_fees)) if ship_fees else 0.0,
+                    _quantile(ship_fees, 0.5), _quantile(ship_fees, 0.9), max(ship_fees or [0.0]),
+                    ship_unknown, ship_cells_changed, "would change" if EBAY_SHIPPING_SHADOW else "written")
+    if ship_deltas:
+        logger.info("eBay delivery cost (SHADOW): the formula price would move by mean %+.1f%%, median %+.1f%%, p90 %+.1f%% "
+                    "over %d row(s); %d would fall (a profit-band edge crossed)",
+                    sum(ship_deltas) / len(ship_deltas), _quantile(ship_deltas, 0.5), _quantile(ship_deltas, 0.9),
+                    len(ship_deltas), sum(1 for d in ship_deltas if d < -0.05))
+    logger.info("OnBuy: %d created, %d updated, %d deferred (awaiting go-live), %d postponed (transient), "
+                 "%d failed, %d removed (brand rejected), %d brand-blocked (flagged), %d skipped (dead eBay link), "
+                 "%d awaiting category (worklist), %d suspended-locked, %d no-price skipped, "
+                 "%d protected (repair pending), %d creates paused",
+                 onbuy_created, onbuy_updated, onbuy_deferred, onbuy_postponed, onbuy_failed, onbuy_removed,
+                 onbuy_brand_blocked, onbuy_skipped_dead, onbuy_needs_category, onbuy_suspended_locked, onbuy_no_price,
+                 onbuy_protected, onbuy_create_paused)
+    if onbuy_halt_reason:
+        logger.warning("OnBuy pushes were halted early this run: %s", onbuy_halt_reason)
+    logger.info("Feed products: %d, skipped: %d", feed_count, skipped_feed)
+    logger.info("Feed URL: %s", feed_url or "(not uploaded - see SUPABASE_URL/SUPABASE_SERVICE_KEY)")
+    logger.info("Supabase database export: %s (%d rows)", "OK" if supabase_ok else "skipped/failed", len(supabase_rows))
+
+    if fetch_failures >= FETCH_FAILURE_ALERT_THRESHOLD or onbuy_failed > 0 or onbuy_removed > 0 or onbuy_postponed > 0:
+        notify.send_alert_email(
+            "Sync run finished with errors" if (fetch_failures or onbuy_failed or onbuy_postponed) else "Sync run removed brand-rejected product(s)",
+            f"eBay fetch failures: {fetch_failures}\n"
+            f"OnBuy push failures: {onbuy_failed} (created {onbuy_created}, updated {onbuy_updated}, "
+            f"deferred awaiting go-live {onbuy_deferred})\n"
+            f"Products awaiting a category (fill the Category column; not counted as failures): {onbuy_needs_category}\n"
+            f"OnBuy pushes postponed (rate limit/token/network - auto-retried next run): {onbuy_postponed}"
+            + (f" - pushing halted early: {onbuy_halt_reason}" if onbuy_halt_reason else "") + "\n"
+            f"Rows removed (brand owned by another seller): {onbuy_removed}"
+            + (f" - SKUs: {', '.join(removed_skus)}" if removed_skus else "") + "\n"
+            f"Updated rows: {updated_count}\n"
+            f"Feed products: {feed_count}, skipped: {skipped_feed}\n"
+            "Check the GitHub Actions run log for details.",
+            routine=True,
+        )
+
+    if run_had_errors:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        logger.exception("Run crashed")
+        notify.send_alert_email("Run crashed", "generate_xml.py raised an unhandled exception - see the GitHub Actions log.")
+        raise

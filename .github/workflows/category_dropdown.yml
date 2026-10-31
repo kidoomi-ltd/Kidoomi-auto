@@ -1,0 +1,45 @@
+name: Category Dropdown + List (sheet only)
+
+# Puts the Category dropdown - the strict list of the "OnBuy Categories" tab, the same one the main tab has - on the Category column of the tabs named in `tab` (comma-separated; default: the Amazon
+# tab), so a wrong category can be changed by hand from the cell. With refresh_list=yes it first brings the "OnBuy Categories" tab up to date with onbuy_categories_only.csv (the list the sync
+# uses; the old list is copied to a backup tab first). Only data validation and that tab are touched: no product cell, no OnBuy, no Keepa. dry_run=yes (the default) only reports.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tab:
+        description: "Worksheet(s) that get the dropdown, comma-separated (default Amazon; e.g. Amazon,Sheet1)"
+        required: false
+        default: "Amazon"
+      column:
+        description: "Column header that gets it (default Category)"
+        required: false
+        default: "Category"
+      refresh_list:
+        description: "yes = first refresh the OnBuy Categories tab from onbuy_categories_only.csv (backup tab first)"
+        required: false
+        default: "no"
+      dry_run:
+        description: "yes = only report, no = write"
+        required: false
+        default: "yes"
+
+jobs:
+  dropdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Category dropdown
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_TAB: ${{ inputs.tab }}
+          COLUMN: ${{ inputs.column }}
+          REFRESH_LIST: ${{ inputs.refresh_list == 'yes' && '1' || '' }}
+          DRY_RUN: ${{ inputs.dry_run == 'no' && '0' || '1' }}
+        run: python category_dropdown.py

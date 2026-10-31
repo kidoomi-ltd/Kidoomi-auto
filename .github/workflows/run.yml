@@ -1,0 +1,149 @@
+name: Kidoomi Full-Auto Sync
+
+on:
+  schedule:
+    - cron: "31 * * * *"   # hourly (was every 2h): GitHub delivers only ~4 of 12 scheduled runs a day here (gaps up to 12h), so asking more often shortens the real gaps; the adaptive batch sizes each run from the time since the last one, so daily eBay spend stays at the budget
+  workflow_dispatch:
+    inputs:
+      recategorize:
+        description: "Let eBay's Type overwrite existing categories (yes/no)"
+        default: "no"
+      refresh_all:
+        description: "Set to yes to ALSO re-fetch already-filled rows. Default: manual runs only fill NEW rows"
+        required: false
+        default: ""
+      rows:
+        description: "Only process these sheet rows, e.g. 2200-2320 or 116 or 10-50,200-210. Empty = normal run"
+        required: false
+        default: ""
+
+# Never let two OnBuy-touching runs execute at the same time - they share the
+# same 240-calls/hour API quota AND a fresh token from one run supersedes the
+# other's mid-flight (confirmed 2026-07-06: a manual run overlapping the
+# scheduled one produced mass "rate limited" + 401 "badToken" failures, and
+# both runs create-raced the same brand-new SKUs). Same group as the hourly
+# backfill workflow so that queues behind a sync run too instead of
+# overlapping it.
+concurrency:
+  group: onbuy-api
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Job-level so the "if:" condition below can read it via the env context -
+      # the secrets context is not a recognized named-value inside if: expressions.
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          RECATEGORIZE_FROM_TYPE: ${{ inputs.recategorize == 'yes' && '1' || '' }}
+          ROWS_RANGE: ${{ inputs.rows }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          ONBUY_CONSUMER_KEY: ${{ secrets.ONBUY_CONSUMER_KEY }}
+          ONBUY_SECRET_KEY: ${{ secrets.ONBUY_SECRET_KEY }}
+          ONBUY_SELLER_ID: ${{ secrets.ONBUY_SELLER_ID }}
+          ONBUY_SITE_ID: ${{ secrets.ONBUY_SITE_ID }}
+          # Off until explicitly turned on - see the comment block in generate_xml.py.
+          ONBUY_API_PUSH_ENABLED: ${{ vars.ONBUY_API_PUSH_ENABLED }}
+          DELIVERY_TEMPLATE_EBAY: ${{ vars.DELIVERY_TEMPLATE_EBAY }}
+          DELIVERY_TEMPLATE_AMAZON: ${{ vars.DELIVERY_TEMPLATE_AMAZON }}
+          OVERSELL_GUARD: ${{ vars.OVERSELL_GUARD }}   # oversell_guard.py kill switch (0 = off)
+          ONBUY_CREATE_ENABLED: ${{ vars.ONBUY_CREATE_ENABLED }}
+          ONBUY_API_TEST_SKUS: ${{ vars.ONBUY_API_TEST_SKUS }}
+          # Set ONBUY_USE_SANDBOX=true (as a repo Variable) to run the whole
+          # pipeline against OnBuy's sandbox account before ever touching
+          # production - see README.md for the recommended rollout order.
+          ONBUY_USE_SANDBOX: ${{ vars.ONBUY_USE_SANDBOX }}
+          ONBUY_TEST_CONSUMER_KEY: ${{ secrets.ONBUY_TEST_CONSUMER_KEY }}
+          ONBUY_TEST_SECRET_KEY: ${{ secrets.ONBUY_TEST_SECRET_KEY }}
+          # Batch size scales automatically from these two - see the comment
+          # in generate_xml.py. RUNS_PER_DAY must match the cron above.
+          # 50/50 split of the shared YRA eBay keyset with the semi line
+          # (yra-global-onbuy-sync drops to 2000 at this repo's go-live).
+          EBAY_DAILY_CALL_BUDGET: ${{ vars.EBAY_DAILY_CALL_BUDGET || '2000' }}
+          RUNS_PER_DAY: ${{ vars.RUNS_PER_DAY || '24' }}
+          # Commission model: "category" prices against OnBuy's real tier per
+          # category (fees.py); unset/anything else keeps the flat 20%.
+          FEE_MODE: ${{ vars.FEE_MODE }}
+          PROFIT_SCHEDULE: ${{ vars.PROFIT_SCHEDULE }}
+          FEE_TIER_MODE: ${{ vars.FEE_TIER_MODE }}
+          # eBay's delivery fee in the cost base and the Shipping Cost (£) cell (user 2026-10-02): '1' = on, 'shadow' =
+          # measure and log only (nothing written or repriced), '0' = off. A repo variable of the same name overrides.
+          EBAY_SHIPPING_COST: ${{ vars.EBAY_SHIPPING_COST || 'shadow' }}
+          MAX_PRODUCTS_PER_RUN: ${{ vars.MAX_PRODUCTS_PER_RUN }}
+          REFRESH_ALL: ${{ inputs.refresh_all }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_FEED_BUCKET: ${{ vars.SUPABASE_FEED_BUCKET }}
+          # Email works with Resend (SMTP_HOST=smtp.resend.com, SMTP_USER=resend,
+          # SMTP_APP_PASSWORD=<API key>, ALERT_EMAIL_FROM=<verified sender>) or
+          # Gmail (just SMTP_USER + app password, no Variables needed).
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          ALERT_EMAIL_FROM: ${{ vars.ALERT_EMAIL_FROM }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python generate_xml.py
+
+      # User 2026-10-12: out-of-stock and brand-blocked eBay rows are deleted from OnBuy and the sheet right after the sync (purge_dead_rows.py).
+      # Kill switch: repo variable PURGE_DEAD_ROWS=0. Report only: PURGE_DRY_RUN=1. It never fails the sync.
+      - name: Purge out-of-stock and brand-blocked eBay rows
+        if: ${{ !cancelled() && format('{0}', vars.PURGE_DEAD_ROWS) != '0' }}
+        continue-on-error: true
+        env:
+          DRY_RUN: ${{ vars.PURGE_DRY_RUN || '0' }}
+          MAX_ROWS: ${{ vars.PURGE_MAX_ROWS || '200' }}
+          MAX_EBAY_CHECKS: ${{ vars.PURGE_MAX_EBAY_CHECKS || '150' }}
+          EBAY_RESERVE: ${{ vars.PURGE_EBAY_RESERVE || '0' }}   # the sync keeps 150 calls in reserve for exactly this
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          ONBUY_USE_SANDBOX: ${{ vars.ONBUY_USE_SANDBOX }}
+          ONBUY_CONSUMER_KEY: ${{ secrets.ONBUY_CONSUMER_KEY }}
+          ONBUY_SECRET_KEY: ${{ secrets.ONBUY_SECRET_KEY }}
+          ONBUY_TEST_CONSUMER_KEY: ${{ secrets.ONBUY_TEST_CONSUMER_KEY }}
+          ONBUY_TEST_SECRET_KEY: ${{ secrets.ONBUY_TEST_SECRET_KEY }}
+          ONBUY_SELLER_ID: ${{ secrets.ONBUY_SELLER_ID }}
+          ONBUY_SITE_ID: ${{ secrets.ONBUY_SITE_ID }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          ALERT_EMAIL_FROM: ${{ vars.ALERT_EMAIL_FROM }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python purge_dead_rows.py
+
+      # feed.xml is uploaded to Supabase Storage from inside generate_xml.py
+      # (see storage.py) once SUPABASE_URL/SUPABASE_SERVICE_KEY secrets exist -
+      # that replaces the old "commit feed.xml every 3 hours forever" step,
+      # which produced 397 of this repo's ~550 commits and grew it unbounded.
+      # Until those two secrets are added, this fallback step keeps the old
+      # git-commit behavior running so the hosted feed URL never goes stale -
+      # remove this step once Supabase Storage is confirmed working.
+      - name: Commit and push XML (fallback - only runs until Supabase secrets are set)
+        if: ${{ env.SUPABASE_URL == '' }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add feed.xml
+          git commit -m "Auto update feed" || echo "No changes"
+          git push

@@ -1,0 +1,64 @@
+name: Repair Descriptions on OnBuy (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report only (yes/no)"
+        default: "yes"
+      max_products:
+        description: "Cap for this run"
+        default: "1000"
+      skip_first:
+        description: "Skip the first N eligible products (paging)"
+        default: "0"
+      select_marked:
+        description: "yes = only rows with visible template junk; no = every row with an OPC"
+        default: "yes"
+      use_listings_opc:
+        description: "yes = take SKU->OPC from the live listings API (covers adopted rows with no stored OPC)"
+        default: "no"
+      limit_skus:
+        description: "Comma-separated SKUs to restrict to (the marker gate is bypassed for named rows)"
+        required: false
+        default: ""
+# OnBuy-touching: queue behind the scheduled sync, never overlap.
+concurrency:
+  group: onbuy-api
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Repair descriptions
+        env:
+          ONBUY_USE_SANDBOX: ${{ vars.ONBUY_USE_SANDBOX }}
+          ONBUY_CONSUMER_KEY: ${{ secrets.ONBUY_CONSUMER_KEY }}
+          ONBUY_SECRET_KEY: ${{ secrets.ONBUY_SECRET_KEY }}
+          ONBUY_TEST_CONSUMER_KEY: ${{ secrets.ONBUY_TEST_CONSUMER_KEY }}
+          ONBUY_TEST_SECRET_KEY: ${{ secrets.ONBUY_TEST_SECRET_KEY }}
+          ONBUY_SELLER_ID: ${{ secrets.ONBUY_SELLER_ID }}
+          ONBUY_SITE_ID: ${{ secrets.ONBUY_SITE_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run == 'no' && '0' || '1' }}
+          MAX_PRODUCTS: ${{ inputs.max_products }}
+          LIMIT_SKUS: ${{ inputs.limit_skus }}
+          SKIP_FIRST: ${{ inputs.skip_first }}
+          SELECT_MARKED: ${{ inputs.select_marked == 'no' && '0' || '1' }}
+          USE_LISTINGS_OPC: ${{ inputs.use_listings_opc == 'yes' && '1' || '0' }}
+        run: python repair_descriptions.py

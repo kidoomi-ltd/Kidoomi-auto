@@ -1,0 +1,34 @@
+name: Setup Store Sheet (one-off)
+
+# Creates Kidoomi_Full_Feed_Master, shares it with the owner, and copies the template store's product-tab header onto the
+# "eBay" tab. Writes row 1 only; idempotent. Dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      share_with:
+        description: "Google account to share the new sheet with (editor)"
+        required: false
+        default: "alphaecommerce99@gmail.com"
+      template_sheet:
+        description: "Sheet whose product-tab header is copied"
+        required: false
+        default: "YRA_Full_Feed_Master"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Create, share and head the sheet
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHARE_WITH: ${{ inputs.share_with }}
+          TEMPLATE_SHEET: ${{ inputs.template_sheet }}
+        run: python -u setup_store_sheet.py

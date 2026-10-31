@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+_old_prototype_backup/
+
+# Operational docs stay on the office PC only - never in the public repo
+README.md
+CLAUDE.md
+*.pdf
+*.docx
+.claude/
+livelog.txt
+absolute-nexus-*.json
+
+# Hand-off file the nightly zero step leaves for the price/stock audit (CI workspace only) - never commit
+held_at_zero.txt
