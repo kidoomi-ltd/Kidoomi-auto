@@ -25,7 +25,7 @@ def test_a_named_tab_is_opened_by_name():
 
 def test_no_tab_means_the_main_product_tab_by_name():
     book = Book()
-    assert rdr.open_tab(book, "") == "ws:Sheet1" and book.asked == ["eBay"]
+    assert rdr.open_tab(book, "") == "ws:eBay" and book.asked == ["eBay"]
 
 
 def test_a_named_tab_never_falls_back_to_the_audited_default_list(monkeypatch):

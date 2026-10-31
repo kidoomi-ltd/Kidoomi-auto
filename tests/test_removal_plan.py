@@ -44,7 +44,7 @@ def test_live_duplicate_goes_while_the_live_keeper_stays():
     rows = [row("eBay", 2, "111", "ebay:1", stock=5), row("eBay", 9, "222", "ebay:1", stock=5)]
     out = removal_plan.plan(rows, [], include_live_dups=True)
     assert names(out["remove"]) == [("eBay", 9)]
-    assert out["remove"][0]["reason"].startswith("live duplicate of Sheet1 row 2")
+    assert out["remove"][0]["reason"].startswith("live duplicate of eBay row 2")
 
 
 def test_first_row_wins_across_tabs_eBay_tab_before_Amazon():

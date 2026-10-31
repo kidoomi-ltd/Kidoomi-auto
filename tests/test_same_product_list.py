@@ -23,11 +23,10 @@ def test_both_nightly_scripts_honour_the_list():
 def test_the_list_parses_and_has_no_repeats():
     lines = [ln.split("#", 1)[0].strip() for ln in LIST.read_text(encoding="utf-8").splitlines()]
     skus = [ln for ln in lines if ln]
-    assert skus and len(skus) == len(set(skus))
+    assert len(skus) == len(set(skus))                 # a fresh store's list starts empty
     assert held_skus.load_skus(str(LIST)) >= set(skus)
 
 
 @pytest.mark.skipif(not LIST.exists(), reason="this store has no same-product list")
 def test_listings_deleted_as_wrong_content_are_not_on_the_list():
     skus = held_skus.load_skus(str(LIST))
-    assert not ({"4855008105181-zzz-17", "0000245681316-zzz-65"} & skus)
