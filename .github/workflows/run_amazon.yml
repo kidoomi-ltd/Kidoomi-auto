@@ -7,7 +7,7 @@ name: Amazon Sync (Keepa)
 # so each hour carries one pipeline's OnBuy pushes (240 calls/hour quota).
 on:
   schedule:
-    - cron: "5 2-20/6 * * *"   # Kidoomi: the reserved lane on the shared second Keepa key (2,8,14,20 at :05); YRA 0,6,12,18 and Arden 3,9,15,21 draw on the same key
+    - cron: "5 2-20/6 * * *"   # Kidoomi: its lane on the second Keepa key (2,8,14,20 at :05); since 2026-11-02 that key is shared with YRA only (0,6,12,18 at :13) - Ardwick moved to key 1
   workflow_dispatch:
     inputs:
       recategorize:
