@@ -1,0 +1,4 @@
+# OnBuy content mismatch: no price/stock pushes until repaired/delisted.
+# 2026-11-13 the nightly found these listings showing ANOTHER product - zeroed and frozen automatically; release only after the page or the row is fixed
+792121605782  # Amazon row 25: row = TCL Q65HK 5.1 ch soundbar for TV,580 Watts, H | page = TCL Q65HK 5.1 soundbar with Dolby Atmos & Ray
+845593889256  # Amazon row 2243: row = cinnkeyi RGB Computer Speakers for Desktop, L | page = PC Speaker PC/Line-In/Bluetooth 3 Modes Compu
