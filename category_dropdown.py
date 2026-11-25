@@ -224,7 +224,9 @@ def main():
     except gspread.exceptions.WorksheetNotFound as exc:
         raise SystemExit(f"STOP: a worksheet is missing in {SHEET_NAME}: {exc}")
     paths = {p.strip() for p in cats.col_values(1) if p and p.strip()}
-    if len(paths) < 100 and not (REFRESH_LIST and created_list_tab):
+    if len(paths) < 100 and not REFRESH_LIST:
+        # with REFRESH_LIST on, a thin/empty tab (e.g. one just created) is about to be rebuilt from
+        # onbuy_categories_only.csv, which refresh_list() itself refuses under 1,000 paths.
         raise SystemExit(f"STOP: the {CATEGORIES_TAB!r} tab holds only {len(paths)} paths - not a category list, nothing changed")
     today = datetime.now(timezone.utc).date().isoformat()
     print(f"sheet {SHEET_NAME} | dry run {'yes' if DRY_RUN else 'no'} | rule: {describe(dropdown_rule())}")
