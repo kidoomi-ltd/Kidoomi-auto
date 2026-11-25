@@ -204,14 +204,27 @@ def main():
     creds = ServiceAccountCredentials.from_json_keyfile_dict(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]), ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
     book = with_retry(lambda: gspread.authorize(creds).open(SHEET_NAME), what="sheet open", max_attempts=3)
+    created_list_tab = False
     try:
         cats = book.worksheet(CATEGORIES_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        # 2026-11-25 (Kidoomi): the newest store never had the list tab. With REFRESH_LIST on it is
+        # created empty here and filled from the file right after; without it there is nothing to
+        # hang the dropdown on, so stop as before.
+        if not REFRESH_LIST:
+            raise SystemExit(f"STOP: no {CATEGORIES_TAB!r} tab and REFRESH_LIST is off - nothing to hang the dropdown on")
+        if DRY_RUN:
+            raise SystemExit(f"DRY RUN - the {CATEGORIES_TAB!r} tab is missing; a live run with REFRESH_LIST creates and fills it")
+        cats = book.add_worksheet(title=CATEGORIES_TAB, rows=8000, cols=1)
+        created_list_tab = True
+        print(f"created the missing {CATEGORIES_TAB!r} tab")
+    try:
         for tab in SHEET_TABS:
             book.worksheet(tab)
     except gspread.exceptions.WorksheetNotFound as exc:
         raise SystemExit(f"STOP: a worksheet is missing in {SHEET_NAME}: {exc}")
     paths = {p.strip() for p in cats.col_values(1) if p and p.strip()}
-    if len(paths) < 100:
+    if len(paths) < 100 and not (REFRESH_LIST and created_list_tab):
         raise SystemExit(f"STOP: the {CATEGORIES_TAB!r} tab holds only {len(paths)} paths - not a category list, nothing changed")
     today = datetime.now(timezone.utc).date().isoformat()
     print(f"sheet {SHEET_NAME} | dry run {'yes' if DRY_RUN else 'no'} | rule: {describe(dropdown_rule())}")
