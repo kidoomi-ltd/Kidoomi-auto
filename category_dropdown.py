@@ -134,12 +134,16 @@ def refresh_list(book, cats, today):
         print(f"DRY RUN - would copy the old list to a new tab '{backup_title({w.title for w in book.worksheets()}, today)}', then write the {len(new)} live paths into {CATEGORIES_TAB}!A1:A{len(new)}")
         return new
     title = backup_title({w.title for w in book.worksheets()}, today)
-    backup = book.add_worksheet(title=title, rows=max(len(old) + 10, 100), cols=1)
-    with_retry(lambda: backup.update(range_name=f"A1:A{len(old)}", values=[[p] for p in old], value_input_option="RAW"), what="write backup", max_attempts=3)
-    saved = [v.strip() for v in backup.col_values(1) if v and v.strip()]
-    if saved != old:
-        raise SystemExit(f"STOP: the backup tab '{title}' does not read back as the old list ({len(saved)} of {len(old)} paths) - the categories tab was NOT touched")
-    print(f"BACKUP '{title}': {len(saved)} paths, read back identical")
+    if not old:
+        print("old list is empty - no backup tab needed")
+        title = None
+    backup = book.add_worksheet(title=title, rows=max(len(old) + 10, 100), cols=1) if title else None
+    if backup is not None:
+        with_retry(lambda: backup.update(range_name=f"A1:A{len(old)}", values=[[p] for p in old], value_input_option="RAW"), what="write backup", max_attempts=3)
+        saved = [v.strip() for v in backup.col_values(1) if v and v.strip()]
+        if saved != old:
+            raise SystemExit(f"STOP: the backup tab '{title}' does not read back as the old list ({len(saved)} of {len(old)} paths) - the categories tab was NOT touched")
+        print(f"BACKUP '{title}': {len(saved)} paths, read back identical")
     if len(new) > cats.row_count:
         cats.add_rows(len(new) - cats.row_count + 10)
     with_retry(lambda: cats.update(range_name=f"A1:A{len(new)}", values=[[p] for p in new], value_input_option="RAW"), what="write categories", max_attempts=3)
