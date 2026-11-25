@@ -11,7 +11,7 @@ name: Nightly Reconcile (content + price + orphans)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "55 2 * * *"
+    - cron: "25 1 * * *"   # was 2:55Z; GitHub delivered it ~3:47Z into the Amazon run window, bumped 3 days running (2026-11-25)
 
 concurrency:
   group: onbuy-api
