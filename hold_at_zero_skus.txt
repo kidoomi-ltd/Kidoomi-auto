@@ -9,3 +9,5 @@
 840414603158  # Amazon row 3689: row = Amazon Kindle 16 GB (2024 model) - Light and | page = Amazon Kindle 11th gen16GB Lightest Green No
 # 2026-11-25 the nightly found these listings showing ANOTHER product - zeroed and frozen automatically; release only after the page or the row is fixed
 982547150311  # Amazon row 3523: row = Car Camera with 8 IR Night Light Dash Cam | page = 3604 Channel Dash Cam Front and Rear with GPS
+# 2026-11-28 the nightly found these listings showing ANOTHER product - zeroed and frozen automatically; release only after the page or the row is fixed
+982374499102  # Amazon row 3516: row = Nutella Advent Calendar with Treats and Gifts | page = Nutella Exclusive Giant Christmas Advent Cale
